@@ -1,0 +1,57 @@
+Poppler for Windows - bundled tool manifest
+============================================
+
+Source:  https://github.com/oschwartz10612/poppler-windows/releases/tag/v26.02.0-0
+Asset:   Release-26.02.0-0.zip (released 2026-05-04, 15.4 MB)
+SHA-256: 993e4a94376ed712fafc7058d724ea0b943d118bbd2305cd9ed55174eb85cda5
+         (matches the sha256 shown on the GitHub release page)
+Fetched: 2026-07-12 directly from the official release URL
+Every bundled file verified byte-identical to the extracted release.
+
+Bundled into data/bin/ (found by the plugin via obs_module_file):
+  pdftoppm.exe : renders PDF pages to PNG (core slide step)
+  pdfinfo.exe  : reads the PDF page count
+  + all runtime DLLs the two tools depend on
+
+Executable hashes:
+  575a2f66073b256f69084c4f12f34427e6076b7854b2505cb09ecbdc9957fd7f  pdftoppm.exe
+  34040ff62bef73d6847a7b443457ac7fe216eb331bfbeadec62ae555618b2aae  pdfinfo.exe
+
+File list (28 files):
+      540672  Lerc.dll
+     1040896  cairo.dll
+       12800  charset.dll
+      177664  deflate.dll
+      266752  expat.dll
+      291328  fontconfig-1.dll
+      684544  freetype.dll
+     1086464  iconv.dll
+      686592  jpeg8.dll
+      581632  lcms2.dll
+     7425536  libcrypto-3-x64.dll
+      753664  libcurl.dll
+      266752  libexpat.dll
+      188416  liblzma.dll
+      198656  libpng16.dll
+      258048  libssh2.dll
+      497152  libtiff.dll
+      658432  libzstd.dll
+      360448  openjp2.dll
+       65536  pdfinfo.exe
+       49664  pdftoppm.exe
+      600576  pixman-1-0.dll
+      177664  poppler-cpp.dll
+      455168  poppler-glib.dll
+     6451712  poppler.dll
+      497152  tiff.dll
+       90624  zlib.dll
+      658432  zstd.dll
+
+Intentionally omitted from the original release:
+  - 10 other poppler tools (pdftotext, pdftocairo, pdfimages, ...)
+    -> not used by this plugin; dead weight
+  - share/poppler (13 MB of CJK encoding data)
+    -> only needed for PDFs with NON-embedded CJK fonts; LibreOffice
+       embeds fonts in its PDF exports. If CJK slide text ever
+       renders blank on Windows, restore it as data/share/poppler.
+  - Library/share (man pages) -> no runtime value

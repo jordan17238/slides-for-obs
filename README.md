@@ -1,59 +1,81 @@
-# OBS Plugin Template
+# ODP Presenter — Native OBS Plugin (work in progress)
 
-## Introduction
+This is the native C plugin port of the Python `obs_odp_presenter.py` script.
+It registers a real **"ODP Presentation"** source type in OBS, so end users
+just Add Source → ODP Presentation, pick a file, and go — no Python, no
+interpreter path, no manual script loading.
 
-The plugin template is meant to be used as a starting point for OBS Studio plugin development. It includes:
+## Current status
 
-* Boilerplate plugin source code
-* A CMake project file
-* GitHub Actions workflows and repository actions
+**Milestone 1 (this code):** loads as a plugin, registers the source type,
+runs the LibreOffice → PDF → PNG pipeline on a background thread, displays
+slides via an internal image source, and supports next/prev/first/last/reload
+hotkeys.
 
-## Supported Build Environments
+**Not yet ported from the Python version:**
+- Incremental rendering (per-page hashing to skip unchanged slides)
+- Parallel page rendering (currently one pdftoppm call for the whole PDF)
+- Fixed 4-digit filename normalisation
+- Scene-aware "active deck" arrow keys (native hotkeys are per-source, which
+  actually solves this more cleanly — each source has its own hotkeys)
 
-| Platform  | Tool   |
-|-----------|--------|
-| Windows   | Visual Studio 17 2022 |
-| macOS     | XCode 16.0 |
-| Windows, macOS  | CMake 3.30.5 |
-| Ubuntu 24.04 | CMake 3.28.3 |
-| Ubuntu 24.04 | `ninja-build` |
-| Ubuntu 24.04 | `pkg-config`
-| Ubuntu 24.04 | `build-essential` |
+These come in milestone 2 once milestone 1 compiles and loads for you.
 
-## Quick Start
+## Why it still needs LibreOffice
 
-An absolute bare-bones [Quick Start Guide](https://github.com/obsproject/obs-plugintemplate/wiki/Quick-Start-Guide) is available in the wiki.
+There is no good native library to render `.odp`. Like the script, the plugin
+shells out to a headless LibreOffice to make a PDF, then rasterises with
+pdftoppm. Your users install LibreOffice (and on Windows, poppler) once —
+everything else is bundled in the plugin.
 
-## Documentation
+## Building
 
-All documentation can be found in the [Plugin Template Wiki](https://github.com/obsproject/obs-plugintemplate/wiki).
+The easiest path is to build inside the official OBS plugin template, which
+provides libobs discovery, packaging, signing hooks, and GitHub Actions CI for
+both macOS and Windows:
 
-Suggested reading to get up and running:
+1. Clone the template:
+   ```
+   git clone https://github.com/obsproject/obs-plugintemplate.git
+   ```
+2. Copy these files in, replacing the template's `src/` and `CMakeLists.txt`:
+   ```
+   src/plugin-main.c
+   src/odp-source.c
+   src/odp-export.c
+   src/odp-export.h
+   CMakeLists.txt   (merge — keep the template's helper includes)
+   ```
+3. Follow the template's build steps:
+   - **macOS:** `cmake --preset macos` then build in Xcode, or
+     `cmake --build --preset macos`
+   - **Windows:** `cmake --preset windows-x64` then build in Visual Studio
 
-* [Getting started](https://github.com/obsproject/obs-plugintemplate/wiki/Getting-Started)
-* [Build system requirements](https://github.com/obsproject/obs-plugintemplate/wiki/Build-System-Requirements)
-* [Build system options](https://github.com/obsproject/obs-plugintemplate/wiki/CMake-Build-System-Options)
+The template's CI can produce signed `.pkg` (macOS) and `.exe`/`.zip`
+(Windows) installers automatically on every git tag — that's how you'd
+distribute to your users.
 
-## GitHub Actions & CI
+## File overview
 
-Default GitHub Actions workflows are available for the following repository actions:
+| File | Purpose |
+|---|---|
+| `src/plugin-main.c` | Module entry point, registers the source type |
+| `src/odp-source.c` | The "ODP Presentation" source: settings, hotkeys, render delegation, worker thread |
+| `src/odp-export.c` | LibreOffice → PDF → PNG pipeline (the C port of the Python logic) |
+| `src/odp-export.h` | Export pipeline interface |
+| `CMakeLists.txt` | Build configuration |
 
-* `push`: Run for commits or tags pushed to `master` or `main` branches.
-* `pr-pull`: Run when a Pull Request has been pushed or synchronized.
-* `dispatch`: Run when triggered by the workflow dispatch in GitHub's user interface.
-* `build-project`: Builds the actual project and is triggered by other workflows.
-* `check-format`: Checks CMake and plugin source code formatting and is triggered by other workflows.
+## Architecture notes
 
-The workflows make use of GitHub repository actions (contained in `.github/actions`) and build scripts (contained in `.github/scripts`) which are not needed for local development, but might need to be adjusted if additional/different steps are required to build the plugin.
+The source doesn't draw pixels itself. It creates a private child
+`image_source` and, on each slide change, updates that child's `file` setting
+to the current `slide-XXXX.png`, then delegates `video_render` to it. This
+reuses OBS's battle-tested image loading/decoding rather than managing GPU
+textures by hand — the same pragmatic choice the Python script made by
+driving an Image source.
 
-### Retrieving build artifacts
-
-Successful builds on GitHub Actions will produce build artifacts that can be downloaded for testing. These artifacts are commonly simple archives and will not contain package installers or installation programs.
-
-### Building a Release
-
-To create a release, an appropriately named tag needs to be pushed to the `main`/`master` branch using semantic versioning (e.g., `12.3.4`, `23.4.5-beta2`). A draft release will be created on the associated repository with generated installer packages or installation programs attached as release artifacts.
-
-## Signing and Notarizing on macOS
-
-Basic concepts of codesigning and notarization on macOS are explained in the correspodning [Wiki article](https://github.com/obsproject/obs-plugintemplate/wiki/Codesigning-On-macOS) which has a specific section for the [GitHub Actions setup](https://github.com/obsproject/obs-plugintemplate/wiki/Codesigning-On-macOS#setting-up-code-signing-for-github-actions).
+Hotkeys are registered with `obs_hotkey_register_source`, meaning each ODP
+source instance gets its own Next/Prev/etc. This is cleaner than the script's
+"active deck" detection: because hotkeys are per-source, OBS routes them to
+whichever source is relevant, and you bind keys per source in Settings →
+Hotkeys.

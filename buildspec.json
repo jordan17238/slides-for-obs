@@ -36,10 +36,10 @@
             "bundleId": "com.example.plugintemplate-for-obs"
         }
     },
-    "name": "plugintemplate-for-obs",
-    "displayName": "Plugin Template for OBS",
-    "version": "1.0.0",
-    "author": "Your Name Here",
+    "name": "slides-for-obs",
+    "displayName": "slides for OBS",
+    "version": "0.1.0",
+    "author": "jordan",
     "website": "https://example.com",
-    "email": "me@example.com"
+    "email": "jordchunter23@gmail.com"
 }
