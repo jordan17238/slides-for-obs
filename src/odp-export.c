@@ -334,8 +334,20 @@ odp_export_result odp_export_range(const char *odp_path, const char *cache_dir,
 		struct dstr cmd;
 		dstr_init(&cmd);
 		append_quoted(&cmd, odp_tool_libreoffice());
-		dstr_cat(&cmd, " -env:UserInstallation=file://");
+		/* Isolated LibreOffice profile, passed as a file URL. Two traps:
+		 *  1. The whole argument must be QUOTED — the cache dir can
+		 *     contain spaces (e.g. "OBS Inputs/obs cache"); unquoted,
+		 *     the shell splits it and soffice receives garbage args and
+		 *     exits 1 (this broke the first Windows run).
+		 *  2. On Windows paths begin with a drive letter (C:/...), so an
+		 *     extra '/' is needed to form the valid file:///C:/... form.
+		 *     POSIX paths already start with '/', yielding file:///...
+		 *     naturally. */
+		dstr_cat(&cmd, " \"-env:UserInstallation=file://");
+		if (profile.array[0] != '/')
+			dstr_cat(&cmd, "/");
 		dstr_cat(&cmd, profile.array);
+		dstr_cat(&cmd, "\"");
 		dstr_cat(&cmd, " --headless --norestore --convert-to pdf --outdir");
 		append_quoted(&cmd, cache_dir);
 		append_quoted(&cmd, odp_path);
