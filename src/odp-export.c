@@ -148,8 +148,25 @@ bool odp_tools_detect(void)
 static int run_blocking(const char *cmdline)
 {
 #if defined(_WIN32)
-	/* _popen/_pclose run through cmd.exe */
-	FILE *p = _popen(cmdline, "r");
+	/* _popen runs the line through `cmd.exe /c`, which has a notorious
+	 * quoting rule: if the command line STARTS with a quote, cmd strips the
+	 * outermost quote pair before parsing. Our lines always start with the
+	 * quoted tool path (e.g. "C:/Program Files/LibreOffice/..."), so cmd was
+	 * removing those quotes and then splitting the path at the space —
+	 * failing with:  'C:/Program' is not recognized ...
+	 * and the tool never launched at all.
+	 *
+	 * The documented remedy is to wrap the ENTIRE command line in one extra
+	 * pair of quotes: cmd removes that outer pair and hands the rest through
+	 * intact. /bin/sh has no such quirk, hence macOS was unaffected. */
+	struct dstr wrapped;
+	dstr_init(&wrapped);
+	dstr_copy(&wrapped, "\"");
+	dstr_cat(&wrapped, cmdline);
+	dstr_cat(&wrapped, "\"");
+
+	FILE *p = _popen(wrapped.array, "r");
+	dstr_free(&wrapped);
 	if (!p)
 		return -1;
 	char buf[256];
@@ -567,7 +584,17 @@ int odp_pdf_page_count(const char *odp_path, const char *cache_dir)
 				append_quoted(&cmd, info.array);
 				append_quoted(&cmd, pdf_path.array);
 #if defined(_WIN32)
-				FILE *pp = _popen(cmd.array, "r");
+				/* Same cmd.exe quote-stripping trap as in
+				 * run_blocking(): wrap the whole line in an
+				 * extra quote pair or cmd splits the tool path
+				 * at its spaces and nothing runs. */
+				struct dstr wrapped;
+				dstr_init(&wrapped);
+				dstr_copy(&wrapped, "\"");
+				dstr_cat(&wrapped, cmd.array);
+				dstr_cat(&wrapped, "\"");
+				FILE *pp = _popen(wrapped.array, "r");
+				dstr_free(&wrapped);
 #else
 				FILE *pp = popen(cmd.array, "r");
 #endif
