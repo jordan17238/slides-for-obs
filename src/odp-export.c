@@ -281,10 +281,21 @@ static int run_argv(const char *const *argv, struct dstr *out,
 	}
 
 	PROCESS_INFORMATION pi = { 0 };
-	/* lpApplicationName = NULL: the (quoted) command line names the exe,
-	 * exactly as when typed by hand. No creation flags. */
-	BOOL ok = CreateProcessA(NULL, cmdline.array, NULL, NULL, TRUE, 0, NULL,
-				 NULL, &si, &pi);
+	/* CREATE_NO_WINDOW: run the tool with no console window at all.
+	 *
+	 * Without it, every spawned tool pops a console the user has to close —
+	 * and closing it KILLS the tool (pdftoppm died with 0xC000013A,
+	 * "terminated by CTRL+C / console close", mid-render).
+	 *
+	 * This flag was briefly removed while hunting a soffice crash, but that
+	 * crash turned out to be a LibreOffice *profile collision* (headless
+	 * soffice handing off to an already-open LibreOffice window), fixed by
+	 * the isolated -env:UserInstallation profile. The two are unrelated, so
+	 * we keep both: a private profile AND no console windows.
+	 *
+	 * lpApplicationName = NULL: the quoted command line names the exe. */
+	BOOL ok = CreateProcessA(NULL, cmdline.array, NULL, NULL, TRUE,
+				 CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
 	if (wr)
 		CloseHandle(wr); /* our copy; child holds the other end */
 
@@ -375,6 +386,34 @@ static int run_argv(const char *const *argv, struct dstr *out,
 }
 
 /* ---- PDF page counting ------------------------------------------------- */
+
+/* Delete every slide-*.png in dir. Used when a render fails part-way, so the
+ * incomplete output can't be mistaken for a valid cached deck next load. */
+static void delete_slide_pngs(const char *dir)
+{
+	os_dir_t *d = os_opendir(dir);
+	if (!d)
+		return;
+
+	struct os_dirent *ent;
+	int removed = 0;
+	while ((ent = os_readdir(d)) != NULL) {
+		if (ent->directory || strncmp(ent->d_name, "slide-", 6) != 0 ||
+		    !strstr(ent->d_name, ".png"))
+			continue;
+		struct dstr p;
+		dstr_init(&p);
+		dstr_printf(&p, "%s/%s", dir, ent->d_name);
+		if (os_unlink(p.array) == 0)
+			removed++;
+		dstr_free(&p);
+	}
+	os_closedir(d);
+	if (removed)
+		blog(LOG_INFO,
+		     "[odp-presenter] removed %d partial slide image(s)",
+		     removed);
+}
 
 /* Count slide-*.png files present in dir. */
 static int count_pngs(const char *dir)
@@ -684,6 +723,19 @@ odp_export_result odp_export_range(const char *odp_path, const char *cache_dir,
 	     last_page >= 1 ? "range" : "end",
 	     (os_gettime_ns() - pt0) / 1.0e9);
 	dstr_free(&prefix);
+
+	/* If the render failed or was killed part-way (e.g. 0xC000013A when a
+	 * console window is closed), any PNGs it managed to write are an
+	 * INCOMPLETE deck. Leaving them behind poisons the cache: the next load
+	 * counts them and happily reports "reusing 9 cached slides" for a
+	 * 60-slide deck. Wipe them so the next attempt re-renders cleanly. */
+	if (rc != 0) {
+		blog(LOG_WARNING,
+		     "[odp-presenter] render failed (code %d) — discarding "
+		     "partial slides so the cache isn't left incomplete",
+		     rc);
+		delete_slide_pngs(cache_dir);
+	}
 
 	if (rc != 0) {
 		snprintf(res.error, sizeof(res.error),
