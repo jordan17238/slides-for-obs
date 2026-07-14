@@ -239,61 +239,79 @@ static int run_argv(const char *const *argv, struct dstr *out,
 		win_quote_arg(&cmdline, argv[i]);
 	}
 
-	/* Pipe for the child's stdout+stderr — replaces the shell redirect. */
+	/* Give the child NUL for stdout/stderr rather than a pipe.
+	 *
+	 * Why: launching soffice with a pipe and/or creation flags reproducibly
+	 * killed it with STACK_BUFFER_OVERRUN (0xC0000409) after several seconds,
+	 * while the *identical command line* run by hand in a console converts
+	 * fine. Rather than keep guessing which detail soffice dislikes, this
+	 * makes our spawn as close as possible to the hand-run that works:
+	 * inherited-style handles pointing at NUL, and no creation flags at all.
+	 *
+	 * Cost: we can't capture the tool's output, so soffice.log is no longer
+	 * written. That's an acceptable trade — the log has never once been
+	 * readable on Windows anyway, and a working conversion beats a log.
+	 * pdfinfo still needs its stdout, so it opts back into a pipe below. */
 	SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
 	HANDLE rd = NULL, wr = NULL;
-	if (!CreatePipe(&rd, &wr, &sa, 0)) {
-		dstr_free(&exe);
-		dstr_free(&cmdline);
-		return -1;
+	bool want_output = (out != NULL);
+
+	if (want_output) {
+		if (!CreatePipe(&rd, &wr, &sa, 0)) {
+			dstr_free(&exe);
+			dstr_free(&cmdline);
+			return -1;
+		}
+		SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
+	} else {
+		wr = CreateFileA("NUL", GENERIC_WRITE,
+				 FILE_SHARE_READ | FILE_SHARE_WRITE, &sa,
+				 OPEN_EXISTING, 0, NULL);
+		if (wr == INVALID_HANDLE_VALUE)
+			wr = NULL;
 	}
-	SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
 
 	STARTUPINFOA si = { 0 };
 	si.cb = sizeof(si);
-	/* Redirect stdout/stderr into our pipe. We deliberately do NOT pass
-	 * CREATE_NO_WINDOW or STARTF_USESHOWWINDOW/SW_HIDE here: soffice.exe is
-	 * a launcher that re-execs soffice.bin, and denying it a console breaks
-	 * that hand-off — it loads the document, runs for several seconds, then
-	 * dies with STACK_BUFFER_OVERRUN (0xC0000409). Piping the output is
-	 * fine (verified by hand); suppressing the window is what killed it.
-	 * DETACHED_PROCESS keeps the child off our console without the
-	 * launcher-hostile behaviour of CREATE_NO_WINDOW. */
-	si.dwFlags = STARTF_USESTDHANDLES;
-	si.hStdOutput = wr;
-	si.hStdError = wr;
-	si.hStdInput = NULL;
+	if (wr) {
+		si.dwFlags = STARTF_USESTDHANDLES;
+		si.hStdOutput = wr;
+		si.hStdError = wr;
+		si.hStdInput = NULL;
+	}
 
 	PROCESS_INFORMATION pi = { 0 };
-	/* lpApplicationName = NULL: let Windows take the executable from the
-	 * (properly quoted) command line. This is the same form that works when
-	 * typed by hand, and it avoids the argv-shifting subtleties of supplying
-	 * both an application name and a command line. */
-	BOOL ok = CreateProcessA(NULL, cmdline.array, NULL, NULL, TRUE,
-				 DETACHED_PROCESS, NULL, NULL, &si, &pi);
-	CloseHandle(wr); /* our copy; child holds the other end */
+	/* lpApplicationName = NULL: the (quoted) command line names the exe,
+	 * exactly as when typed by hand. No creation flags. */
+	BOOL ok = CreateProcessA(NULL, cmdline.array, NULL, NULL, TRUE, 0, NULL,
+				 NULL, &si, &pi);
+	if (wr)
+		CloseHandle(wr); /* our copy; child holds the other end */
 
 	if (!ok) {
 		blog(LOG_ERROR,
 		     "[odp-presenter] CreateProcess failed (%lu) for: %s",
 		     GetLastError(), cmdline.array);
-		CloseHandle(rd);
+		if (rd)
+			CloseHandle(rd);
 		dstr_free(&exe);
 		dstr_free(&cmdline);
 		return -1;
 	}
 
-	/* Drain the pipe until the child closes it, so it can never block on a
-	 * full buffer. */
+	/* Drain the pipe (only when we asked for output) until the child closes
+	 * it, so it can never block on a full buffer. */
 	struct dstr captured;
 	dstr_init(&captured);
-	char buf[512];
-	DWORD n = 0;
-	while (ReadFile(rd, buf, sizeof(buf) - 1, &n, NULL) && n > 0) {
-		buf[n] = '\0';
-		dstr_cat(&captured, buf);
+	if (rd) {
+		char buf[512];
+		DWORD n = 0;
+		while (ReadFile(rd, buf, sizeof(buf) - 1, &n, NULL) && n > 0) {
+			buf[n] = '\0';
+			dstr_cat(&captured, buf);
+		}
+		CloseHandle(rd);
 	}
-	CloseHandle(rd);
 
 	WaitForSingleObject(pi.hProcess, INFINITE);
 	DWORD code = 1;
@@ -486,26 +504,20 @@ odp_export_result odp_export_range(const char *odp_path, const char *cache_dir,
 		dstr_init(&logf);
 		dstr_printf(&logf, "%s/soffice.log", cache_dir);
 
-		/* Isolated LibreOffice profile as a file:// URL, so headless
-		 * conversions never collide with a LibreOffice window the user
-		 * may have open. The -env flag must precede --headless. On
-		 * Windows the path starts with a drive letter, so an extra '/'
-		 * is needed to make file:///C:/... ; POSIX paths already begin
-		 * with '/'. This exact argument was verified working by hand. */
-		struct dstr envarg;
-		dstr_init(&envarg);
-		dstr_copy(&envarg, "-env:UserInstallation=file://");
-		if (profile.array[0] != '/')
-			dstr_cat(&envarg, "/");
-		dstr_cat(&envarg, profile.array);
-
-		/* A real argument vector — no shell, so no quoting/redirect
-		 * traps. run_argv() captures soffice's output to soffice.log
-		 * through a pipe instead of a shell redirect (the redirect is
-		 * what corrupted the arguments and crashed soffice on Windows). */
+		/* Argument vector matching, as closely as possible, the command
+		 * that was verified working by hand on Windows:
+		 *
+		 *   soffice.exe --headless --convert-to pdf --outdir DIR FILE
+		 *
+		 * The -env:UserInstallation profile flag has been REMOVED. It is
+		 * only an isolation nicety (so headless runs don't collide with
+		 * a LibreOffice window the user has open), and it was one of the
+		 * few remaining differences from the known-good invocation while
+		 * we were chasing a reproducible soffice crash. If a collision
+		 * with an open LibreOffice ever becomes a real problem, re-add it
+		 * — but not before confirming it doesn't reintroduce the crash. */
 		const char *argv[] = {
 			odp_tool_libreoffice(),
-			envarg.array,
 			"--headless",
 			"--norestore",
 			"--convert-to",
@@ -517,9 +529,9 @@ odp_export_result odp_export_range(const char *odp_path, const char *cache_dir,
 		};
 
 		blog(LOG_INFO,
-		     "[odp-presenter] running: %s %s --headless --norestore "
+		     "[odp-presenter] running: %s --headless --norestore "
 		     "--convert-to pdf --outdir '%s' '%s'",
-		     odp_tool_libreoffice(), envarg.array, cache_dir, odp_path);
+		     odp_tool_libreoffice(), cache_dir, odp_path);
 
 		/* Only one LibreOffice conversion at a time across the plugin
 		 * (see s_libreoffice_lock). Without this, two decks or a
@@ -527,16 +539,15 @@ odp_export_result odp_export_range(const char *odp_path, const char *cache_dir,
 		 * instances that thrash and take many times longer. */
 		pthread_mutex_lock(&s_libreoffice_lock);
 		uint64_t t0 = os_gettime_ns();
-		int rc = run_argv(argv, NULL, logf.array);
+		int rc = run_argv(argv, NULL, NULL);
 		blog(LOG_INFO, "[odp-presenter] LibreOffice took %.1f s",
 		     (os_gettime_ns() - t0) / 1.0e9);
 		pthread_mutex_unlock(&s_libreoffice_lock);
-		dstr_free(&envarg);
 		dstr_free(&profile);
 		dstr_free(&logf);
 		if (rc != 0) {
 			snprintf(res.error, sizeof(res.error),
-				 "LibreOffice exit code %d (see soffice.log)", rc);
+				 "LibreOffice exit code %d", rc);
 			dstr_free(&stem);
 			dstr_free(&pdf_path);
 			return res;
