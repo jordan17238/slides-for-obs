@@ -14,6 +14,10 @@
 #include "odp-export.h"
 #include <sys/stat.h>
 
+#if defined(_WIN32)
+#include <windows.h>
+#endif
+
 #include <obs-module.h>
 #include <util/platform.h>
 #include <util/threading.h>
@@ -145,56 +149,28 @@ bool odp_tools_detect(void)
  * shell. For a production plugin you'd switch to posix_spawn / CreateProcess
  * for robust argument handling, but this is clear and works for our paths.
  */
-static int run_blocking(const char *cmdline)
-{
-#if defined(_WIN32)
-	/* _popen runs the line through `cmd.exe /c`, which has a notorious
-	 * quoting rule: if the command line STARTS with a quote, cmd strips the
-	 * outermost quote pair before parsing. Our lines always start with the
-	 * quoted tool path (e.g. "C:/Program Files/LibreOffice/..."), so cmd was
-	 * removing those quotes and then splitting the path at the space —
-	 * failing with:  'C:/Program' is not recognized ...
-	 * and the tool never launched at all.
-	 *
-	 * The documented remedy is to wrap the ENTIRE command line in one extra
-	 * pair of quotes: cmd removes that outer pair and hands the rest through
-	 * intact. /bin/sh has no such quirk, hence macOS was unaffected. */
-	struct dstr wrapped;
-	dstr_init(&wrapped);
-	dstr_copy(&wrapped, "\"");
-	dstr_cat(&wrapped, cmdline);
-	dstr_cat(&wrapped, "\"");
+/* ---- process execution -------------------------------------------------
+ *
+ * WINDOWS: we do NOT go through cmd.exe. Building a command string and letting
+ * cmd parse it produced three separate, hard-to-find bugs (quote stripping at
+ * the start of the line, an unquoted argument containing spaces, and a `>`
+ * redirect that corrupted the argument list badly enough to crash soffice with
+ * STACK_BUFFER_OVERRUN). CreateProcess takes the arguments we actually mean,
+ * with one well-defined quoting rule, and stdout is captured through a pipe
+ * rather than a shell redirect — so the whole class of bug disappears.
+ *
+ * POSIX: popen with a shell-quoted line, which has always worked fine.
+ *
+ * Both platforms go through run_argv(): pass argv as a NULL-terminated array.
+ * If `out` is non-NULL, the child's stdout+stderr are appended to it.
+ * If `log_path` is non-NULL, they're also written to that file.
+ */
 
-	FILE *p = _popen(wrapped.array, "r");
-	dstr_free(&wrapped);
-	if (!p)
-		return -1;
-	char buf[256];
-	while (fgets(buf, sizeof(buf), p))
-		; /* drain output */
-	return _pclose(p);
-#else
-	FILE *p = popen(cmdline, "r");
-	if (!p)
-		return -1;
-	char buf[256];
-	while (fgets(buf, sizeof(buf), p))
-		;
-	int status = pclose(p);
-	return status;
-#endif
-}
-
-/* Append a shell-quoted argument to a dstr command line. */
-static void append_quoted(struct dstr *cmd, const char *arg)
+#if !defined(_WIN32)
+/* Single-quote an argument for /bin/sh. No leading space — the caller spaces. */
+static void append_quoted_posix(struct dstr *cmd, const char *arg)
 {
-#if defined(_WIN32)
-	dstr_cat(cmd, " \"");
-	dstr_cat(cmd, arg);
-	dstr_cat(cmd, "\"");
-#else
-	dstr_cat(cmd, " '");
-	/* naive escape of single quotes */
+	dstr_cat(cmd, "'");
 	for (const char *c = arg; *c; c++) {
 		if (*c == '\'')
 			dstr_cat(cmd, "'\\''");
@@ -202,6 +178,157 @@ static void append_quoted(struct dstr *cmd, const char *arg)
 			dstr_ncat(cmd, c, 1);
 	}
 	dstr_cat(cmd, "'");
+}
+#endif
+
+#if defined(_WIN32)
+/* Quote one argument per the MSVCRT/CommandLineToArgvW rules that
+ * CreateProcess consumers use: wrap in quotes if it contains a space or quote,
+ * escape embedded quotes, and double any backslashes that immediately precede
+ * a quote. */
+static void win_quote_arg(struct dstr *out, const char *arg)
+{
+	bool needs = (*arg == '\0') || strpbrk(arg, " \t\"") != NULL;
+	if (!needs) {
+		dstr_cat(out, arg);
+		return;
+	}
+	dstr_cat(out, "\"");
+	int backslashes = 0;
+	for (const char *p = arg; *p; p++) {
+		if (*p == '\\') {
+			backslashes++;
+			continue;
+		}
+		if (*p == '"') {
+			/* escape the run of backslashes, then the quote */
+			for (int i = 0; i < backslashes * 2 + 1; i++)
+				dstr_cat(out, "\\");
+			backslashes = 0;
+			dstr_cat(out, "\"");
+			continue;
+		}
+		for (int i = 0; i < backslashes; i++)
+			dstr_cat(out, "\\");
+		backslashes = 0;
+		char c[2] = { *p, '\0' };
+		dstr_cat(out, c);
+	}
+	/* trailing backslashes must be doubled before the closing quote */
+	for (int i = 0; i < backslashes * 2; i++)
+		dstr_cat(out, "\\");
+	dstr_cat(out, "\"");
+}
+#endif
+
+static int run_argv(const char *const *argv, struct dstr *out,
+		    const char *log_path)
+{
+#if defined(_WIN32)
+	/* argv[0] is the executable; build the command line CreateProcess wants.
+	 * Backslashes are the native separator, so normalise the exe path. */
+	struct dstr exe;
+	dstr_init_copy(&exe, argv[0]);
+	dstr_replace(&exe, "/", "\\");
+
+	struct dstr cmdline;
+	dstr_init(&cmdline);
+	win_quote_arg(&cmdline, exe.array);
+	for (int i = 1; argv[i]; i++) {
+		dstr_cat(&cmdline, " ");
+		win_quote_arg(&cmdline, argv[i]);
+	}
+
+	/* Pipe for the child's stdout+stderr — replaces the shell redirect. */
+	SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
+	HANDLE rd = NULL, wr = NULL;
+	if (!CreatePipe(&rd, &wr, &sa, 0)) {
+		dstr_free(&exe);
+		dstr_free(&cmdline);
+		return -1;
+	}
+	SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
+
+	STARTUPINFOA si = { 0 };
+	si.cb = sizeof(si);
+	si.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
+	si.wShowWindow = SW_HIDE; /* no flashing console windows */
+	si.hStdOutput = wr;
+	si.hStdError = wr;
+	si.hStdInput = NULL;
+
+	PROCESS_INFORMATION pi = { 0 };
+	BOOL ok = CreateProcessA(exe.array, cmdline.array, NULL, NULL, TRUE,
+				 CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
+	CloseHandle(wr); /* our copy; child holds the other end */
+
+	if (!ok) {
+		blog(LOG_ERROR,
+		     "[odp-presenter] CreateProcess failed (%lu) for: %s",
+		     GetLastError(), cmdline.array);
+		CloseHandle(rd);
+		dstr_free(&exe);
+		dstr_free(&cmdline);
+		return -1;
+	}
+
+	/* Drain the pipe until the child closes it, so it can never block on a
+	 * full buffer. */
+	struct dstr captured;
+	dstr_init(&captured);
+	char buf[512];
+	DWORD n = 0;
+	while (ReadFile(rd, buf, sizeof(buf) - 1, &n, NULL) && n > 0) {
+		buf[n] = '\0';
+		dstr_cat(&captured, buf);
+	}
+	CloseHandle(rd);
+
+	WaitForSingleObject(pi.hProcess, INFINITE);
+	DWORD code = 1;
+	GetExitCodeProcess(pi.hProcess, &code);
+	CloseHandle(pi.hProcess);
+	CloseHandle(pi.hThread);
+
+	if (log_path && captured.array) {
+		FILE *f = os_fopen(log_path, "wb");
+		if (f) {
+			fwrite(captured.array, 1, strlen(captured.array), f);
+			fclose(f);
+		}
+	}
+	if (out && captured.array)
+		dstr_cat(out, captured.array);
+
+	dstr_free(&captured);
+	dstr_free(&exe);
+	dstr_free(&cmdline);
+	return (int)code;
+#else
+	/* POSIX: shell-quote into a line and popen it (unchanged behaviour). */
+	struct dstr cmd;
+	dstr_init(&cmd);
+	for (int i = 0; argv[i]; i++) {
+		if (i)
+			dstr_cat(&cmd, " ");
+		append_quoted_posix(&cmd, argv[i]);
+	}
+	if (log_path) {
+		dstr_cat(&cmd, " > ");
+		append_quoted_posix(&cmd, log_path);
+		dstr_cat(&cmd, " 2>&1");
+	}
+
+	FILE *p = popen(cmd.array, "r");
+	dstr_free(&cmd);
+	if (!p)
+		return -1;
+	char buf[512];
+	while (fgets(buf, sizeof(buf), p)) {
+		if (out)
+			dstr_cat(out, buf);
+	}
+	return pclose(p);
 #endif
 }
 
@@ -348,31 +475,40 @@ odp_export_result odp_export_range(const char *odp_path, const char *cache_dir,
 		dstr_init(&logf);
 		dstr_printf(&logf, "%s/soffice.log", cache_dir);
 
-		struct dstr cmd;
-		dstr_init(&cmd);
-		append_quoted(&cmd, odp_tool_libreoffice());
-		/* Isolated LibreOffice profile, passed as a file URL. Two traps:
-		 *  1. The whole argument must be QUOTED — the cache dir can
-		 *     contain spaces (e.g. "OBS Inputs/obs cache"); unquoted,
-		 *     the shell splits it and soffice receives garbage args and
-		 *     exits 1 (this broke the first Windows run).
-		 *  2. On Windows paths begin with a drive letter (C:/...), so an
-		 *     extra '/' is needed to form the valid file:///C:/... form.
-		 *     POSIX paths already start with '/', yielding file:///...
-		 *     naturally. */
-		dstr_cat(&cmd, " \"-env:UserInstallation=file://");
+		/* Isolated LibreOffice profile as a file:// URL, so headless
+		 * conversions never collide with a LibreOffice window the user
+		 * may have open. The -env flag must precede --headless. On
+		 * Windows the path starts with a drive letter, so an extra '/'
+		 * is needed to make file:///C:/... ; POSIX paths already begin
+		 * with '/'. This exact argument was verified working by hand. */
+		struct dstr envarg;
+		dstr_init(&envarg);
+		dstr_copy(&envarg, "-env:UserInstallation=file://");
 		if (profile.array[0] != '/')
-			dstr_cat(&cmd, "/");
-		dstr_cat(&cmd, profile.array);
-		dstr_cat(&cmd, "\"");
-		dstr_cat(&cmd, " --headless --norestore --convert-to pdf --outdir");
-		append_quoted(&cmd, cache_dir);
-		append_quoted(&cmd, odp_path);
-		dstr_cat(&cmd, " > ");
-		append_quoted(&cmd, logf.array);
-		dstr_cat(&cmd, " 2>&1");
+			dstr_cat(&envarg, "/");
+		dstr_cat(&envarg, profile.array);
 
-		blog(LOG_INFO, "[odp-presenter] running: %s", cmd.array);
+		/* A real argument vector — no shell, so no quoting/redirect
+		 * traps. run_argv() captures soffice's output to soffice.log
+		 * through a pipe instead of a shell redirect (the redirect is
+		 * what corrupted the arguments and crashed soffice on Windows). */
+		const char *argv[] = {
+			odp_tool_libreoffice(),
+			envarg.array,
+			"--headless",
+			"--norestore",
+			"--convert-to",
+			"pdf",
+			"--outdir",
+			cache_dir,
+			odp_path,
+			NULL,
+		};
+
+		blog(LOG_INFO,
+		     "[odp-presenter] running: %s %s --headless --norestore "
+		     "--convert-to pdf --outdir '%s' '%s'",
+		     odp_tool_libreoffice(), envarg.array, cache_dir, odp_path);
 
 		/* Only one LibreOffice conversion at a time across the plugin
 		 * (see s_libreoffice_lock). Without this, two decks or a
@@ -380,11 +516,11 @@ odp_export_result odp_export_range(const char *odp_path, const char *cache_dir,
 		 * instances that thrash and take many times longer. */
 		pthread_mutex_lock(&s_libreoffice_lock);
 		uint64_t t0 = os_gettime_ns();
-		int rc = run_blocking(cmd.array);
+		int rc = run_argv(argv, NULL, logf.array);
 		blog(LOG_INFO, "[odp-presenter] LibreOffice took %.1f s",
 		     (os_gettime_ns() - t0) / 1.0e9);
 		pthread_mutex_unlock(&s_libreoffice_lock);
-		dstr_free(&cmd);
+		dstr_free(&envarg);
 		dstr_free(&profile);
 		dstr_free(&logf);
 		if (rc != 0) {
@@ -448,25 +584,38 @@ odp_export_result odp_export_range(const char *odp_path, const char *cache_dir,
 	dstr_init(&prefix);
 	dstr_printf(&prefix, "%s/slide", cache_dir);
 
-	struct dstr rcmd;
-	dstr_init(&rcmd);
-	append_quoted(&rcmd, odp_tool_pdftoppm());
-	dstr_catf(&rcmd, " -r %d -png", dpi);
-	if (first_page >= 1)
-		dstr_catf(&rcmd, " -f %d", first_page);
-	if (last_page >= 1)
-		dstr_catf(&rcmd, " -l %d", last_page);
-	append_quoted(&rcmd, pdf_path.array);
-	append_quoted(&rcmd, prefix.array);
+	/* Build pdftoppm's arguments as a real vector (no shell). Numeric
+	 * arguments are rendered into small local buffers. */
+	char dpi_s[16], first_s[16], last_s[16];
+	snprintf(dpi_s, sizeof(dpi_s), "%d", dpi);
+	snprintf(first_s, sizeof(first_s), "%d", first_page);
+	snprintf(last_s, sizeof(last_s), "%d", last_page);
+
+	const char *rargv[16];
+	int n = 0;
+	rargv[n++] = odp_tool_pdftoppm();
+	rargv[n++] = "-r";
+	rargv[n++] = dpi_s;
+	rargv[n++] = "-png";
+	if (first_page >= 1) {
+		rargv[n++] = "-f";
+		rargv[n++] = first_s;
+	}
+	if (last_page >= 1) {
+		rargv[n++] = "-l";
+		rargv[n++] = last_s;
+	}
+	rargv[n++] = pdf_path.array;
+	rargv[n++] = prefix.array;
+	rargv[n] = NULL;
 
 	uint64_t pt0 = os_gettime_ns();
-	int rc = run_blocking(rcmd.array);
+	int rc = run_argv(rargv, NULL, NULL);
 	blog(LOG_INFO,
 	     "[odp-presenter] pdftoppm (pages %d-%s) took %.1f s",
 	     first_page >= 1 ? first_page : 1,
 	     last_page >= 1 ? "range" : "end",
 	     (os_gettime_ns() - pt0) / 1.0e9);
-	dstr_free(&rcmd);
 	dstr_free(&prefix);
 
 	if (rc != 0) {
@@ -579,40 +728,24 @@ int odp_pdf_page_count(const char *odp_path, const char *cache_dir)
 #endif
 			}
 			if (file_exists(info.array)) {
-				struct dstr cmd;
-				dstr_init(&cmd);
-				append_quoted(&cmd, info.array);
-				append_quoted(&cmd, pdf_path.array);
-#if defined(_WIN32)
-				/* Same cmd.exe quote-stripping trap as in
-				 * run_blocking(): wrap the whole line in an
-				 * extra quote pair or cmd splits the tool path
-				 * at its spaces and nothing runs. */
-				struct dstr wrapped;
-				dstr_init(&wrapped);
-				dstr_copy(&wrapped, "\"");
-				dstr_cat(&wrapped, cmd.array);
-				dstr_cat(&wrapped, "\"");
-				FILE *pp = _popen(wrapped.array, "r");
-				dstr_free(&wrapped);
-#else
-				FILE *pp = popen(cmd.array, "r");
-#endif
-				if (pp) {
-					char line[256];
-					while (fgets(line, sizeof(line), pp)) {
-						if (strncmp(line, "Pages:", 6) == 0) {
-							pages = atoi(line + 6);
-							break;
-						}
-					}
-#if defined(_WIN32)
-					_pclose(pp);
-#else
-					pclose(pp);
-#endif
+				/* Run pdfinfo through the same shell-free path
+				 * and capture its stdout, then find the Pages:
+				 * line. */
+				const char *iargv[] = {
+					info.array,
+					pdf_path.array,
+					NULL,
+				};
+				struct dstr out;
+				dstr_init(&out);
+				run_argv(iargv, &out, NULL);
+				if (out.array) {
+					const char *p = strstr(out.array,
+							       "Pages:");
+					if (p)
+						pages = atoi(p + 6);
 				}
-				dstr_free(&cmd);
+				dstr_free(&out);
 			}
 			dstr_free(&info);
 		}
