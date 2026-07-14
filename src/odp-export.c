@@ -251,15 +251,26 @@ static int run_argv(const char *const *argv, struct dstr *out,
 
 	STARTUPINFOA si = { 0 };
 	si.cb = sizeof(si);
-	si.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
-	si.wShowWindow = SW_HIDE; /* no flashing console windows */
+	/* Redirect stdout/stderr into our pipe. We deliberately do NOT pass
+	 * CREATE_NO_WINDOW or STARTF_USESHOWWINDOW/SW_HIDE here: soffice.exe is
+	 * a launcher that re-execs soffice.bin, and denying it a console breaks
+	 * that hand-off — it loads the document, runs for several seconds, then
+	 * dies with STACK_BUFFER_OVERRUN (0xC0000409). Piping the output is
+	 * fine (verified by hand); suppressing the window is what killed it.
+	 * DETACHED_PROCESS keeps the child off our console without the
+	 * launcher-hostile behaviour of CREATE_NO_WINDOW. */
+	si.dwFlags = STARTF_USESTDHANDLES;
 	si.hStdOutput = wr;
 	si.hStdError = wr;
 	si.hStdInput = NULL;
 
 	PROCESS_INFORMATION pi = { 0 };
-	BOOL ok = CreateProcessA(exe.array, cmdline.array, NULL, NULL, TRUE,
-				 CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
+	/* lpApplicationName = NULL: let Windows take the executable from the
+	 * (properly quoted) command line. This is the same form that works when
+	 * typed by hand, and it avoids the argv-shifting subtleties of supplying
+	 * both an application name and a command line. */
+	BOOL ok = CreateProcessA(NULL, cmdline.array, NULL, NULL, TRUE,
+				 DETACHED_PROCESS, NULL, NULL, &si, &pi);
 	CloseHandle(wr); /* our copy; child holds the other end */
 
 	if (!ok) {
