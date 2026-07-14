@@ -313,9 +313,22 @@ static int run_argv(const char *const *argv, struct dstr *out,
 		CloseHandle(rd);
 	}
 
-	WaitForSingleObject(pi.hProcess, INFINITE);
+	/* Wait for the child, but never forever. A soffice that collides with a
+	 * running LibreOffice instance (or stops on a hidden dialog) will sit
+	 * there indefinitely, and without a bound this thread would hang for the
+	 * life of OBS. Five minutes is far beyond any legitimate conversion. */
+	DWORD wait = WaitForSingleObject(pi.hProcess, 5 * 60 * 1000);
 	DWORD code = 1;
-	GetExitCodeProcess(pi.hProcess, &code);
+	if (wait == WAIT_TIMEOUT) {
+		blog(LOG_ERROR,
+		     "[odp-presenter] tool timed out after 5 min; terminating. "
+		     "Is a LibreOffice window open and blocking headless mode?");
+		TerminateProcess(pi.hProcess, 1);
+		WaitForSingleObject(pi.hProcess, 5000);
+		code = 1;
+	} else {
+		GetExitCodeProcess(pi.hProcess, &code);
+	}
 	CloseHandle(pi.hProcess);
 	CloseHandle(pi.hThread);
 
@@ -504,20 +517,50 @@ odp_export_result odp_export_range(const char *odp_path, const char *cache_dir,
 		dstr_init(&logf);
 		dstr_printf(&logf, "%s/soffice.log", cache_dir);
 
-		/* Argument vector matching, as closely as possible, the command
-		 * that was verified working by hand on Windows:
+		/* LibreOffice profile isolation.
 		 *
-		 *   soffice.exe --headless --convert-to pdf --outdir DIR FILE
+		 * This flag is NOT optional: if the user has a LibreOffice window
+		 * open, a headless soffice with the default profile tries to hand
+		 * off to that running instance and then hangs (or dies). It must
+		 * have a profile of its own.
 		 *
-		 * The -env:UserInstallation profile flag has been REMOVED. It is
-		 * only an isolation nicety (so headless runs don't collide with
-		 * a LibreOffice window the user has open), and it was one of the
-		 * few remaining differences from the known-good invocation while
-		 * we were chasing a reproducible soffice crash. If a collision
-		 * with an open LibreOffice ever becomes a real problem, re-add it
-		 * — but not before confirming it doesn't reintroduce the crash. */
+		 * But the URL is fragile. Earlier we pointed it at the slide cache
+		 * dir, whose path routinely contains spaces ("OBS Inputs/obs
+		 * cache") — and a file:// URL with raw spaces is malformed. So:
+		 *   - put the profile under the plugin's own config directory,
+		 *     which we control and can keep space-free;
+		 *   - percent-encode anything left over (spaces in the Windows
+		 *     user name, etc.) so the URL is always well-formed;
+		 *   - and on Windows prepend the extra '/' for file:///C:/...
+		 */
+		char *cfg = obs_module_config_path("lo_profile");
+		struct dstr profdir;
+		dstr_init(&profdir);
+		if (cfg && *cfg) {
+			dstr_copy(&profdir, cfg);
+		} else {
+			/* Fall back to the cache dir if config path is absent. */
+			dstr_printf(&profdir, "%s/lo_profile", cache_dir);
+		}
+		bfree(cfg);
+		dstr_replace(&profdir, "\\", "/");
+		os_mkdirs(profdir.array);
+
+		struct dstr envarg;
+		dstr_init(&envarg);
+		dstr_copy(&envarg, "-env:UserInstallation=file://");
+		if (profdir.array[0] != '/')
+			dstr_cat(&envarg, "/"); /* file:///C:/... on Windows */
+		for (const char *c = profdir.array; *c; c++) {
+			if (*c == ' ')
+				dstr_cat(&envarg, "%20");
+			else
+				dstr_ncat(&envarg, c, 1);
+		}
+
 		const char *argv[] = {
 			odp_tool_libreoffice(),
+			envarg.array,
 			"--headless",
 			"--norestore",
 			"--convert-to",
@@ -529,9 +572,9 @@ odp_export_result odp_export_range(const char *odp_path, const char *cache_dir,
 		};
 
 		blog(LOG_INFO,
-		     "[odp-presenter] running: %s --headless --norestore "
+		     "[odp-presenter] running: %s %s --headless --norestore "
 		     "--convert-to pdf --outdir '%s' '%s'",
-		     odp_tool_libreoffice(), cache_dir, odp_path);
+		     odp_tool_libreoffice(), envarg.array, cache_dir, odp_path);
 
 		/* Only one LibreOffice conversion at a time across the plugin
 		 * (see s_libreoffice_lock). Without this, two decks or a
@@ -543,6 +586,8 @@ odp_export_result odp_export_range(const char *odp_path, const char *cache_dir,
 		blog(LOG_INFO, "[odp-presenter] LibreOffice took %.1f s",
 		     (os_gettime_ns() - t0) / 1.0e9);
 		pthread_mutex_unlock(&s_libreoffice_lock);
+		dstr_free(&envarg);
+		dstr_free(&profdir);
 		dstr_free(&profile);
 		dstr_free(&logf);
 		if (rc != 0) {
