@@ -1,0 +1,100 @@
+# Builds the Windows installer (SlidesForOBS-Setup.exe) from the plugin that
+# the main build workflow (push.yaml) produces.
+#
+# It runs after "Push" completes successfully. It downloads the Windows x64
+# artifact from that run, unpacks it, installs Inno Setup, compiles the
+# installer script against the unpacked files, and uploads the resulting
+# SlidesForOBS-Setup.exe as its own artifact.
+#
+# This is a SEPARATE workflow so it never interferes with the plugin build
+# itself — if the installer step ever breaks, the plugin artifacts are
+# unaffected.
+
+name: Build Installer
+
+on:
+  workflow_run:
+    workflows: ["Push"]         # name of the plugin-template build workflow
+    types: [completed]
+  workflow_dispatch:             # allow manual runs too
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  installer:
+    # Only run if the build we depend on actually succeeded.
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: windows-latest
+    steps:
+      - name: Check out repository (for the .iss script)
+        uses: actions/checkout@v4
+
+      - name: Download the Windows plugin artifact
+        uses: actions/download-artifact@v4
+        with:
+          # The plugin-template names the Windows artifact like
+          # "slides-for-obs-<version>-windows-x64-<sha>". Match by pattern and
+          # pull whichever Windows one exists from the triggering run.
+          pattern: "*windows-x64*"
+          path: artifact-download
+          merge-multiple: true
+          # For workflow_run, artifacts live on the triggering run.
+          run-id: ${{ github.event.workflow_run.id || github.run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Unpack the plugin into dist\
+        shell: pwsh
+        run: |
+          # The downloaded artifact is a .zip whose single entry is another
+          # .zip (GitHub double-wraps), containing a "slides-for-obs" tree.
+          $inner = Get-ChildItem -Recurse artifact-download -Filter *.zip |
+                   Select-Object -First 1
+          if ($null -eq $inner) {
+            # Some runs may already be unzipped; look for the tree directly.
+            $tree = Get-ChildItem -Recurse artifact-download -Directory `
+                    -Filter "slides-for-obs" | Select-Object -First 1
+            if ($null -eq $tree) { throw "No plugin zip or tree found." }
+            New-Item -ItemType Directory -Force dist | Out-Null
+            Copy-Item $tree.FullName -Destination dist\slides-for-obs -Recurse
+          } else {
+            Expand-Archive -Path $inner.FullName -DestinationPath dist -Force
+          }
+          Write-Host "dist tree:"
+          Get-ChildItem -Recurse dist | Select-Object FullName
+
+      - name: Derive version string
+        id: ver
+        shell: pwsh
+        run: |
+          # Pull the version out of the artifact/dir name if present, else 0.1.0
+          $name = (Get-ChildItem artifact-download -Recurse -Filter *.zip |
+                   Select-Object -First 1).BaseName
+          $v = "0.1.0"
+          if ($name -match "(\d+\.\d+\.\d+)") { $v = $Matches[1] }
+          "version=$v" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Write-Host "version = $v"
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --no-progress -y
+
+      - name: Compile installer
+        shell: pwsh
+        run: |
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          & $iscc `
+            "/DMyAppVersion=${{ steps.ver.outputs.version }}" `
+            "/DDistDir=dist\slides-for-obs" `
+            installer\slides-for-obs.iss
+          Get-ChildItem -Recurse installer\Output
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: SlidesForOBS-Setup-${{ steps.ver.outputs.version }}
+          path: installer/Output/SlidesForOBS-Setup.exe
+          if-no-files-found: error
