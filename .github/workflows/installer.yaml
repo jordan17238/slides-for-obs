@@ -90,16 +90,32 @@ jobs:
         shell: pwsh
         run: |
           $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
-          $outDir = Join-Path $env:GITHUB_WORKSPACE "installer\Output"
+          $ws = $env:GITHUB_WORKSPACE
+          $outDir = Join-Path $ws "installer\Output"
+          $distDir = Join-Path $ws "dist\slides-for-obs"
           New-Item -ItemType Directory -Force $outDir | Out-Null
-          # /O pins the output directory (absolute) so we always know where the
-          # .exe lands regardless of the .iss file's own OutputDir.
+
+          # Show exactly what ISCC will be pointed at, so a missing source
+          # file is obvious in the log.
+          Write-Host "=== DistDir = $distDir ==="
+          if (Test-Path $distDir) {
+            Get-ChildItem -Recurse $distDir | Select-Object FullName
+          } else {
+            throw "dist dir not found: $distDir"
+          }
+
+          # Compile. Capture ISCC's own stdout/stderr (it prints the specific
+          # 'cannot find file' with the offending path on failure).
           & $iscc `
             "/DMyAppVersion=${{ steps.ver.outputs.version }}" `
-            "/DDistDir=$env:GITHUB_WORKSPACE\dist\slides-for-obs" `
+            "/DDistDir=$distDir" `
             "/O$outDir" `
-            "$env:GITHUB_WORKSPACE\installer\slides-for-obs.iss"
-          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with $LASTEXITCODE" }
+            "$ws\installer\slides-for-obs.iss" 2>&1 | Tee-Object -Variable isccLog
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "----- ISCC output -----"
+            $isccLog | ForEach-Object { Write-Host $_ }
+            throw "ISCC failed with $LASTEXITCODE"
+          }
           Write-Host "Output dir contents:"
           Get-ChildItem $outDir
 
