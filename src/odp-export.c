@@ -441,6 +441,34 @@ static int count_pngs(const char *dir)
 /* ---- export entry point ------------------------------------------------ */
 
 /* Thin wrapper: full export, all pages. */
+/* Shared: cache_dir + sanitised filename stem. See header. */
+void odp_deck_subdir(const char *odp_path, const char *cache_dir,
+		     char *out, size_t out_size)
+{
+	const char *base = strrchr(odp_path, '/');
+#if defined(_WIN32)
+	const char *base_bs = strrchr(odp_path, '\\');
+	if (base_bs && (!base || base_bs > base))
+		base = base_bs;
+#endif
+	base = base ? base + 1 : odp_path;
+
+	struct dstr stem;
+	dstr_init_copy(&stem, base);
+	char *dot = strrchr(stem.array, '.');
+	if (dot)
+		*dot = '\0';
+	for (char *q = stem.array; q && *q; q++) {
+		if (*q == '/' || *q == '\\' || *q == ':' || *q == '*' ||
+		    *q == '?' || *q == '"' || *q == '<' || *q == '>' ||
+		    *q == '|')
+			*q = '_';
+	}
+
+	snprintf(out, out_size, "%s/%s", cache_dir, stem.array);
+	dstr_free(&stem);
+}
+
 odp_export_result odp_export(const char *odp_path, const char *cache_dir,
 			     int dpi, int workers)
 {
@@ -472,49 +500,16 @@ odp_export_result odp_export_range(const char *odp_path, const char *cache_dir,
 
 	os_mkdirs(cache_dir);
 
-	/* ── Fast path: reuse existing slides ────────────────────────────
-	 * If we already have slide PNGs that are newer than BOTH the source
-	 * .odp and the intermediate PDF, the cache is current — skip the slow
-	 * LibreOffice render and just report the count. We compare against the
-	 * .odp (so edits invalidate the cache) using the WIDEST-padded slide-1
-	 * name first, since the canonical full-deck render uses the widest
-	 * padding; checking a stale narrow name (e.g. slide-1.png left over
-	 * from an old render) would give a wrong, too-old comparison. */
-	if (first_page <= 1 && last_page == 0) {
-		int existing = count_pngs(cache_dir);
-		if (existing > 0) {
-			struct stat odp_st, png_st;
-			struct dstr first_png;
-			dstr_init(&first_png);
-			bool got_png = false;
-			/* widest-first so we match the canonical render's name */
-			for (int w = 6; w >= 1 && !got_png; w--) {
-				dstr_printf(&first_png, "%s/slide-%0*d.png",
-					    cache_dir, w, 1);
-				if (stat(first_png.array, &png_st) == 0)
-					got_png = true;
-			}
-			if (got_png && stat(odp_path, &odp_st) == 0 &&
-			    png_st.st_mtime >= odp_st.st_mtime) {
-				res.ok = true;
-				res.slide_count = existing;
-				blog(LOG_INFO,
-				     "[odp-presenter] reusing %d cached slides "
-				     "(no re-export needed)", existing);
-				dstr_free(&first_png);
-				return res;
-			}
-			dstr_free(&first_png);
-		}
-	}
-
-	/* ── Stage 1: ODP -> PDF ─────────────────────────────────────── */
-	/* Use a private LibreOffice profile inside the cache dir so this
-	 * never collides with a LibreOffice the user already has open. The
-	 * -env flag must come first, before --headless. We redirect output
-	 * to a log file so failures are visible. */
-	/* Derive the PDF name (same stem as the ODP) up front so we can decide
-	 * whether the LibreOffice step is needed at all. */
+	/* ── Per-deck working subfolder ──────────────────────────────────
+	 * Multiple ODP sources can (and typically will) share one cache
+	 * folder. pdftoppm names its output slide-01.png, slide-02.png … with
+	 * no deck identifier, so if two decks rendered into the same directory
+	 * they'd overwrite each other's PNGs and every source would show the
+	 * SAME slides (whichever deck rendered last). To keep them separate,
+	 * each deck gets its own subfolder under the cache dir, named from the
+	 * presentation's filename stem. Everything below — the reuse check, the
+	 * PDF, the PNGs, counting and cleanup — operates inside this per-deck
+	 * `work_dir`, so decks never collide even in a shared cache folder. */
 	const char *base = strrchr(odp_path, '/');
 #if defined(_WIN32)
 	const char *base_bs = strrchr(odp_path, '\\');
@@ -528,10 +523,60 @@ odp_export_result odp_export_range(const char *odp_path, const char *cache_dir,
 	char *dot = strrchr(stem.array, '.');
 	if (dot)
 		*dot = '\0';
+	for (char *q = stem.array; q && *q; q++) {
+		if (*q == '/' || *q == '\\' || *q == ':' || *q == '*' ||
+		    *q == '?' || *q == '"' || *q == '<' || *q == '>' ||
+		    *q == '|')
+			*q = '_';
+	}
+
+	/* Per-deck subfolder via the SHARED helper, so the source's render path
+	 * (which calls the same helper) looks in exactly this directory. */
+	char work_buf[1024];
+	odp_deck_subdir(odp_path, cache_dir, work_buf, sizeof(work_buf));
+	struct dstr work;
+	dstr_init_copy(&work, work_buf);
+	os_mkdirs(work.array);
+	const char *work_dir = work.array;
+
+	/* ── Fast path: reuse existing slides ────────────────────────────
+	 * If we already have slide PNGs that are newer than the source .odp,
+	 * the cache is current — skip the slow LibreOffice render and just
+	 * report the count. Widest-padded slide-1 name first, matching the
+	 * canonical full-deck render's padding. */
+	if (first_page <= 1 && last_page == 0) {
+		int existing = count_pngs(work_dir);
+		if (existing > 0) {
+			struct stat odp_st, png_st;
+			struct dstr first_png;
+			dstr_init(&first_png);
+			bool got_png = false;
+			for (int w = 6; w >= 1 && !got_png; w--) {
+				dstr_printf(&first_png, "%s/slide-%0*d.png",
+					    work_dir, w, 1);
+				if (stat(first_png.array, &png_st) == 0)
+					got_png = true;
+			}
+			if (got_png && stat(odp_path, &odp_st) == 0 &&
+			    png_st.st_mtime >= odp_st.st_mtime) {
+				res.ok = true;
+				res.slide_count = existing;
+				blog(LOG_INFO,
+				     "[odp-presenter] reusing %d cached slides "
+				     "for '%s' (no re-export needed)",
+				     existing, stem.array);
+				dstr_free(&first_png);
+				dstr_free(&stem);
+				dstr_free(&work);
+				return res;
+			}
+			dstr_free(&first_png);
+		}
+	}
 
 	struct dstr pdf_path;
 	dstr_init(&pdf_path);
-	dstr_printf(&pdf_path, "%s/%s.pdf", cache_dir, stem.array);
+	dstr_printf(&pdf_path, "%s/%s.pdf", work_dir, stem.array);
 
 	/* Skip the (slow) LibreOffice conversion if a PDF already exists and is
 	 * at least as new as the .odp. This makes the tail render of the staged
@@ -605,7 +650,7 @@ odp_export_result odp_export_range(const char *odp_path, const char *cache_dir,
 			"--convert-to",
 			"pdf",
 			"--outdir",
-			cache_dir,
+			work_dir,
 			odp_path,
 			NULL,
 		};
@@ -613,7 +658,7 @@ odp_export_result odp_export_range(const char *odp_path, const char *cache_dir,
 		blog(LOG_INFO,
 		     "[odp-presenter] running: %s %s --headless --norestore "
 		     "--convert-to pdf --outdir '%s' '%s'",
-		     odp_tool_libreoffice(), envarg.array, cache_dir, odp_path);
+		     odp_tool_libreoffice(), envarg.array, work_dir, odp_path);
 
 		/* Only one LibreOffice conversion at a time across the plugin
 		 * (see s_libreoffice_lock). Without this, two decks or a
@@ -642,7 +687,7 @@ odp_export_result odp_export_range(const char *odp_path, const char *cache_dir,
 		 * (especially if the deck got shorter, e.g. 156 -> 60 slides)
 		 * cannot survive and inflate the count or shadow new content.
 		 * The render below recreates the current set cleanly. */
-		os_dir_t *d = os_opendir(cache_dir);
+		os_dir_t *d = os_opendir(work_dir);
 		if (d) {
 			struct os_dirent *ent;
 			while ((ent = os_readdir(d)) != NULL) {
@@ -652,7 +697,7 @@ odp_export_result odp_export_range(const char *odp_path, const char *cache_dir,
 				    strstr(ent->d_name, ".png")) {
 					struct dstr p;
 					dstr_init(&p);
-					dstr_printf(&p, "%s/%s", cache_dir,
+					dstr_printf(&p, "%s/%s", work_dir,
 						    ent->d_name);
 					os_unlink(p.array);
 					dstr_free(&p);
@@ -669,26 +714,23 @@ odp_export_result odp_export_range(const char *odp_path, const char *cache_dir,
 		snprintf(res.error, sizeof(res.error),
 			 "PDF not produced (%s)", pdf_path.array);
 		dstr_free(&stem);
+		dstr_free(&work);
 		dstr_free(&pdf_path);
 		return res;
 	}
-
-	/* ── Stage 2: PDF -> PNGs ────────────────────────────────────── */
-	/* First clear stale PNGs. */
-	/* (Iterating dir + removing is omitted for brevity here; pdftoppm
-	 *  overwrites by page number which is sufficient for now.) */
 
 	if (!odp_tool_pdftoppm()) {
 		snprintf(res.error, sizeof(res.error),
 			 "pdftoppm not found");
 		dstr_free(&stem);
+		dstr_free(&work);
 		dstr_free(&pdf_path);
 		return res;
 	}
 
 	struct dstr prefix;
 	dstr_init(&prefix);
-	dstr_printf(&prefix, "%s/slide", cache_dir);
+	dstr_printf(&prefix, "%s/slide", work_dir);
 
 	/* Build pdftoppm's arguments as a real vector (no shell). Numeric
 	 * arguments are rendered into small local buffers. */
@@ -734,34 +776,33 @@ odp_export_result odp_export_range(const char *odp_path, const char *cache_dir,
 		     "[odp-presenter] render failed (code %d) — discarding "
 		     "partial slides so the cache isn't left incomplete",
 		     rc);
-		delete_slide_pngs(cache_dir);
+		delete_slide_pngs(work_dir);
 	}
 
 	if (rc != 0) {
 		snprintf(res.error, sizeof(res.error),
 			 "pdftoppm exit code %d", rc);
 		dstr_free(&stem);
+		dstr_free(&work);
 		dstr_free(&pdf_path);
 		return res;
 	}
 
-	res.slide_count = count_pngs(cache_dir);
+	res.slide_count = count_pngs(work_dir);
 	res.ok = res.slide_count > 0;
 	if (!res.ok)
 		snprintf(res.error, sizeof(res.error),
 			 "no PNGs produced");
 
-	/* After a FULL render, pdftoppm has written the canonical page-number
-	 * width (e.g. 3 digits for a 100+ page deck). A previous focused render
-	 * may have left narrower-width PNGs (e.g. slide-7.png) that would shadow
-	 * the canonical slide-007.png in the widest-first path lookup. Prune any
-	 * slide PNG that doesn't match the canonical width. We do this AFTER the
-	 * render (not before) so the live slide is never momentarily missing. */
+	/* After a FULL render, prune any slide PNG whose page-number width
+	 * doesn't match the canonical width, so a leftover narrow name can't
+	 * shadow the canonical one. Done AFTER the render so the live slide is
+	 * never momentarily missing. Operates within this deck's work_dir. */
 	if (res.ok && first_page <= 1 && last_page == 0) {
 		int canon_w = 1;
 		for (int n = res.slide_count; n >= 10; n /= 10)
 			canon_w++;
-		os_dir_t *d = os_opendir(cache_dir);
+		os_dir_t *d = os_opendir(work_dir);
 		if (d) {
 			struct os_dirent *ent;
 			while ((ent = os_readdir(d)) != NULL) {
@@ -770,7 +811,6 @@ odp_export_result odp_export_range(const char *odp_path, const char *cache_dir,
 				if (strncmp(ent->d_name, "slide-", 6) != 0 ||
 				    !strstr(ent->d_name, ".png"))
 					continue;
-				/* digits between "slide-" and ".png" */
 				const char *num = ent->d_name + 6;
 				int w = 0;
 				while (num[w] >= '0' && num[w] <= '9')
@@ -778,7 +818,7 @@ odp_export_result odp_export_range(const char *odp_path, const char *cache_dir,
 				if (w != canon_w) {
 					struct dstr p;
 					dstr_init(&p);
-					dstr_printf(&p, "%s/%s", cache_dir,
+					dstr_printf(&p, "%s/%s", work_dir,
 						    ent->d_name);
 					os_unlink(p.array);
 					dstr_free(&p);
@@ -789,6 +829,7 @@ odp_export_result odp_export_range(const char *odp_path, const char *cache_dir,
 	}
 
 	dstr_free(&stem);
+	dstr_free(&work);
 	dstr_free(&pdf_path);
 	return res;
 }

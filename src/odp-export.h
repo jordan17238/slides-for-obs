@@ -12,6 +12,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stddef.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -70,6 +71,18 @@ odp_export_result odp_export_range(const char *odp_path,
 /* Returns the page count of the most recently produced PDF in cache_dir,
  * or 0 if none/unknown. Cheap; reads the PDF only. */
 int odp_pdf_page_count(const char *odp_path, const char *cache_dir);
+
+/*
+ * Compute the per-deck working subfolder for a presentation: cache_dir plus a
+ * sanitised version of the presentation's filename stem. Both the exporter and
+ * the source's render path MUST use this so they agree on where a deck's PNGs
+ * live. Multiple decks can share one cache_dir without their slide-NN.png
+ * files colliding, because each deck gets its own subfolder here.
+ *
+ * Writes the full path into `out` (a char buffer) up to out_size bytes.
+ */
+void odp_deck_subdir(const char *odp_path, const char *cache_dir,
+		     char *out, size_t out_size);
 
 #ifdef __cplusplus
 }
