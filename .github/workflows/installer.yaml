@@ -24,10 +24,14 @@ permissions:
 
 jobs:
   installer:
-    # Only run if the build we depend on actually succeeded.
+    # Run whenever the plugin build workflow COMPLETES. We deliberately do not
+    # require conclusion == 'success', because the template's clang-format /
+    # gersemi style checks can mark the whole run "failure" even when the
+    # actual Windows plugin built fine. If there's genuinely no Windows
+    # artifact, the download step below fails cleanly instead.
     if: >
       github.event_name == 'workflow_dispatch' ||
-      github.event.workflow_run.conclusion == 'success'
+      github.event.workflow_run.event == 'push'
     runs-on: windows-latest
     steps:
       - name: Check out repository (for the .iss script)
