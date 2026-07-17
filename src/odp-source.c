@@ -455,23 +455,17 @@ static void odp_navigate(struct odp_source *s, int action)
 /* Defined below — true if this source is in the scene the operator is driving
  * (preview scene in Studio Mode, otherwise the live/program scene). */
 static bool source_is_in_active_scene(struct odp_source *s);
-/* Same, but explicitly the PROGRAM (live) scene or explicitly the PREVIEW
- * scene, regardless of Studio Mode. Used by the split Live/Preview dock
- * buttons so the operator can drive either side without disturbing the other. */
-static bool source_is_in_program_scene(struct odp_source *s);
-static bool source_is_in_preview_scene(struct odp_source *s);
 
-/* Internal: drive whichever deck is in the scene returned by `picker`.
- * The dock and hotkey entry points are thin wrappers around this. */
-typedef bool (*scene_picker_fn)(struct odp_source *);
-
-static void odp_navigate_in_scene(int action, scene_picker_fn picker,
-				   const char *which)
+/* Public entry point used by the on-screen dock buttons (odp-dock.cpp).
+ * Drives the deck in the scene the operator is currently working with, using
+ * the SAME preview/program rule as the per-source hotkeys, so the dock and the
+ * keyboard behave identically. action: 0=next 1=prev 2=first 3=last 4=reload */
+void odp_navigate_active(int action)
 {
 	/* Snapshot the current sources under the lock, then release it BEFORE
-	 * calling the picker, which calls into the OBS frontend API. Holding
-	 * our registry lock across an OBS call could deadlock if OBS calls
-	 * back into our source callbacks. */
+	 * calling source_is_in_active_scene(), which calls into the OBS
+	 * frontend API. Holding our registry lock across an OBS call could
+	 * deadlock if OBS calls back into our source callbacks. */
 	struct odp_source *snapshot[ODP_MAX_SOURCES];
 	int n = 0;
 	pthread_mutex_lock(&g_registry_lock);
@@ -482,14 +476,13 @@ static void odp_navigate_in_scene(int action, scene_picker_fn picker,
 
 	struct odp_source *target = NULL;
 	for (int i = 0; i < n; i++) {
-		if (picker(snapshot[i])) {
+		if (source_is_in_active_scene(snapshot[i])) {
 			target = snapshot[i];
 			break;
 		}
 	}
-	/* Fallback: if no deck matched but there's only one deck, act on it.
-	 * This keeps the simple single-deck case working even outside Studio
-	 * Mode where preview vs program isn't meaningful. */
+	/* Fallback: if scene membership found nothing but there is exactly one
+	 * deck, act on it. */
 	if (!target && total == 1)
 		target = snapshot[0];
 
@@ -497,70 +490,10 @@ static void odp_navigate_in_scene(int action, scene_picker_fn picker,
 		odp_navigate(target, action);
 	} else {
 		blog(LOG_WARNING,
-		     "[odp-presenter] dock %s: no deck in %s scene "
-		     "(sources=%d)",
-		     which, which, total);
+		     "[odp-presenter] dock: no active deck (sources=%d) — is "
+		     "an ODP source in the current/preview scene?",
+		     total);
 	}
-}
-
-/* Public entry points used by the on-screen dock buttons (odp-dock.cpp).
- * action: 0=next 1=prev 2=first 3=last 4=reload */
-
-/* Drives the deck in the LIVE (program) scene — the one currently going to
- * recording/output. Available even when Studio Mode is on, so the operator can
- * advance the live deck without first swapping it back to preview. */
-void odp_navigate_program(int action)
-{
-	odp_navigate_in_scene(action, source_is_in_program_scene, "live");
-}
-
-/* Drives the deck in the PREVIEW scene (Studio Mode only). */
-void odp_navigate_preview(int action)
-{
-	odp_navigate_in_scene(action, source_is_in_preview_scene, "preview");
-}
-
-/* Drives the "active" deck using the original rule (preview if Studio Mode,
- * else program). Kept for the per-source hotkeys, which continue to behave
- * as before. The dock now uses the explicit program/preview variants above. */
-void odp_navigate_active(int action)
-{
-	odp_navigate_in_scene(action, source_is_in_active_scene, "active");
-}
-
-/* Helper: is `s` in the scene currently held by `scene_src`? scene_src may be
- * NULL (no such scene), in which case we return false. Does not take
- * ownership; caller releases scene_src. */
-static bool source_in_scene_src(struct odp_source *s, obs_source_t *scene_src)
-{
-	if (!scene_src)
-		return false;
-	bool found = false;
-	obs_scene_t *scene = obs_scene_from_source(scene_src);
-	if (scene) {
-		const char *name = obs_source_get_name(s->self);
-		if (name && obs_scene_find_source(scene, name))
-			found = true;
-	}
-	return found;
-}
-
-static bool source_is_in_program_scene(struct odp_source *s)
-{
-	obs_source_t *prog = obs_frontend_get_current_scene();
-	bool found = source_in_scene_src(s, prog);
-	if (prog)
-		obs_source_release(prog);
-	return found;
-}
-
-static bool source_is_in_preview_scene(struct odp_source *s)
-{
-	obs_source_t *prev = obs_frontend_get_current_preview_scene();
-	bool found = source_in_scene_src(s, prev);
-	if (prev)
-		obs_source_release(prev);
-	return found;
 }
 
 /* Returns true if this source is part of the scene the user is currently
@@ -576,9 +509,17 @@ static bool source_is_in_active_scene(struct odp_source *s)
 	obs_source_t *scene_src = obs_frontend_get_current_preview_scene();
 	if (!scene_src)
 		scene_src = obs_frontend_get_current_scene();
-	bool found = source_in_scene_src(s, scene_src);
-	if (scene_src)
-		obs_source_release(scene_src);
+	if (!scene_src)
+		return false;
+
+	bool found = false;
+	obs_scene_t *scene = obs_scene_from_source(scene_src);
+	if (scene) {
+		const char *name = obs_source_get_name(s->self);
+		if (name && obs_scene_find_source(scene, name))
+			found = true;
+	}
+	obs_source_release(scene_src);
 	return found;
 }
 
@@ -847,19 +788,6 @@ static obs_properties_t *odp_get_properties(void *data)
 {
 	UNUSED_PARAMETER(data);
 	obs_properties_t *props = obs_properties_create();
-
-	/* If LibreOffice can't be found, the export pipeline can't run, so
-	 * surface a clear, actionable message right at the top of the source's
-	 * settings rather than letting the source silently stay blank. */
-	if (!odp_tool_libreoffice()) {
-		obs_property_t *warn = obs_properties_add_text(
-			props, "lo_missing_warning",
-			"LibreOffice was not found. This plugin needs "
-			"LibreOffice to convert slides. Install it (free) "
-			"from libreoffice.org, then reopen this source.",
-			OBS_TEXT_INFO);
-		obs_property_text_set_info_type(warn, OBS_TEXT_INFO_WARNING);
-	}
 
 	obs_properties_add_path(props, "odp_path", "Presentation file",
 				OBS_PATH_FILE,
