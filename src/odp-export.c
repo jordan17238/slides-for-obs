@@ -56,8 +56,7 @@ static bool file_exists(const char *p)
 	return os_file_exists(p);
 }
 
-static bool first_existing(const char *const *candidates, char *out,
-			   size_t out_sz)
+static bool first_existing(const char *const *candidates, char *out, size_t out_sz)
 {
 	for (int i = 0; candidates[i]; i++) {
 		if (file_exists(candidates[i])) {
@@ -102,11 +101,15 @@ bool odp_tools_detect(void)
 	};
 #else
 	static const char *lo[] = {
-		"/usr/bin/libreoffice", "/usr/bin/soffice",
-		"/usr/local/bin/libreoffice", NULL,
+		"/usr/bin/libreoffice",
+		"/usr/bin/soffice",
+		"/usr/local/bin/libreoffice",
+		NULL,
 	};
 	static const char *pp[] = {
-		"/usr/bin/pdftoppm", "/usr/local/bin/pdftoppm", NULL,
+		"/usr/bin/pdftoppm",
+		"/usr/local/bin/pdftoppm",
+		NULL,
 	};
 #endif
 
@@ -133,10 +136,8 @@ bool odp_tools_detect(void)
 	if (!have_pp)
 		have_pp = first_existing(pp, s_pdftoppm, sizeof(s_pdftoppm));
 
-	blog(LOG_INFO, "[odp-presenter] LibreOffice: %s",
-	     have_lo ? s_libreoffice : "NOT FOUND");
-	blog(LOG_INFO, "[odp-presenter] pdftoppm: %s",
-	     have_pp ? s_pdftoppm : "not found");
+	blog(LOG_INFO, "[odp-presenter] LibreOffice: %s", have_lo ? s_libreoffice : "NOT FOUND");
+	blog(LOG_INFO, "[odp-presenter] pdftoppm: %s", have_pp ? s_pdftoppm : "not found");
 
 	return have_lo;
 }
@@ -211,7 +212,7 @@ static void win_quote_arg(struct dstr *out, const char *arg)
 		for (int i = 0; i < backslashes; i++)
 			dstr_cat(out, "\\");
 		backslashes = 0;
-		char c[2] = { *p, '\0' };
+		char c[2] = {*p, '\0'};
 		dstr_cat(out, c);
 	}
 	/* trailing backslashes must be doubled before the closing quote */
@@ -221,8 +222,7 @@ static void win_quote_arg(struct dstr *out, const char *arg)
 }
 #endif
 
-static int run_argv(const char *const *argv, struct dstr *out,
-		    const char *log_path)
+static int run_argv(const char *const *argv, struct dstr *out, const char *log_path)
 {
 #if defined(_WIN32)
 	/* argv[0] is the executable; build the command line CreateProcess wants.
@@ -252,7 +252,7 @@ static int run_argv(const char *const *argv, struct dstr *out,
 	 * written. That's an acceptable trade — the log has never once been
 	 * readable on Windows anyway, and a working conversion beats a log.
 	 * pdfinfo still needs its stdout, so it opts back into a pipe below. */
-	SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
+	SECURITY_ATTRIBUTES sa = {sizeof(sa), NULL, TRUE};
 	HANDLE rd = NULL, wr = NULL;
 	bool want_output = (out != NULL);
 
@@ -264,14 +264,12 @@ static int run_argv(const char *const *argv, struct dstr *out,
 		}
 		SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
 	} else {
-		wr = CreateFileA("NUL", GENERIC_WRITE,
-				 FILE_SHARE_READ | FILE_SHARE_WRITE, &sa,
-				 OPEN_EXISTING, 0, NULL);
+		wr = CreateFileA("NUL", GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, OPEN_EXISTING, 0, NULL);
 		if (wr == INVALID_HANDLE_VALUE)
 			wr = NULL;
 	}
 
-	STARTUPINFOA si = { 0 };
+	STARTUPINFOA si = {0};
 	si.cb = sizeof(si);
 	if (wr) {
 		si.dwFlags = STARTF_USESTDHANDLES;
@@ -280,7 +278,7 @@ static int run_argv(const char *const *argv, struct dstr *out,
 		si.hStdInput = NULL;
 	}
 
-	PROCESS_INFORMATION pi = { 0 };
+	PROCESS_INFORMATION pi = {0};
 	/* CREATE_NO_WINDOW: run the tool with no console window at all.
 	 *
 	 * Without it, every spawned tool pops a console the user has to close —
@@ -294,15 +292,12 @@ static int run_argv(const char *const *argv, struct dstr *out,
 	 * we keep both: a private profile AND no console windows.
 	 *
 	 * lpApplicationName = NULL: the quoted command line names the exe. */
-	BOOL ok = CreateProcessA(NULL, cmdline.array, NULL, NULL, TRUE,
-				 CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
+	BOOL ok = CreateProcessA(NULL, cmdline.array, NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
 	if (wr)
 		CloseHandle(wr); /* our copy; child holds the other end */
 
 	if (!ok) {
-		blog(LOG_ERROR,
-		     "[odp-presenter] CreateProcess failed (%lu) for: %s",
-		     GetLastError(), cmdline.array);
+		blog(LOG_ERROR, "[odp-presenter] CreateProcess failed (%lu) for: %s", GetLastError(), cmdline.array);
 		if (rd)
 			CloseHandle(rd);
 		dstr_free(&exe);
@@ -331,9 +326,8 @@ static int run_argv(const char *const *argv, struct dstr *out,
 	DWORD wait = WaitForSingleObject(pi.hProcess, 5 * 60 * 1000);
 	DWORD code = 1;
 	if (wait == WAIT_TIMEOUT) {
-		blog(LOG_ERROR,
-		     "[odp-presenter] tool timed out after 5 min; terminating. "
-		     "Is a LibreOffice window open and blocking headless mode?");
+		blog(LOG_ERROR, "[odp-presenter] tool timed out after 5 min; terminating. "
+				"Is a LibreOffice window open and blocking headless mode?");
 		TerminateProcess(pi.hProcess, 1);
 		WaitForSingleObject(pi.hProcess, 5000);
 		code = 1;
@@ -398,8 +392,7 @@ static void delete_slide_pngs(const char *dir)
 	struct os_dirent *ent;
 	int removed = 0;
 	while ((ent = os_readdir(d)) != NULL) {
-		if (ent->directory || strncmp(ent->d_name, "slide-", 6) != 0 ||
-		    !strstr(ent->d_name, ".png"))
+		if (ent->directory || strncmp(ent->d_name, "slide-", 6) != 0 || !strstr(ent->d_name, ".png"))
 			continue;
 		struct dstr p;
 		dstr_init(&p);
@@ -410,9 +403,7 @@ static void delete_slide_pngs(const char *dir)
 	}
 	os_closedir(d);
 	if (removed)
-		blog(LOG_INFO,
-		     "[odp-presenter] removed %d partial slide image(s)",
-		     removed);
+		blog(LOG_INFO, "[odp-presenter] removed %d partial slide image(s)", removed);
 }
 
 /* Count slide-*.png files present in dir. */
@@ -427,9 +418,7 @@ static int count_pngs(const char *dir)
 	if (d) {
 		struct os_dirent *ent;
 		while ((ent = os_readdir(d)) != NULL) {
-			if (!ent->directory &&
-			    strncmp(ent->d_name, "slide-", 6) == 0 &&
-			    strstr(ent->d_name, ".png"))
+			if (!ent->directory && strncmp(ent->d_name, "slide-", 6) == 0 && strstr(ent->d_name, ".png"))
 				count++;
 		}
 		os_closedir(d);
@@ -442,8 +431,7 @@ static int count_pngs(const char *dir)
 
 /* Thin wrapper: full export, all pages. */
 /* Shared: cache_dir + sanitised filename stem. See header. */
-void odp_deck_subdir(const char *odp_path, const char *cache_dir,
-		     char *out, size_t out_size)
+void odp_deck_subdir(const char *odp_path, const char *cache_dir, char *out, size_t out_size)
 {
 	const char *base = strrchr(odp_path, '/');
 #if defined(_WIN32)
@@ -459,9 +447,8 @@ void odp_deck_subdir(const char *odp_path, const char *cache_dir,
 	if (dot)
 		*dot = '\0';
 	for (char *q = stem.array; q && *q; q++) {
-		if (*q == '/' || *q == '\\' || *q == ':' || *q == '*' ||
-		    *q == '?' || *q == '"' || *q == '<' || *q == '>' ||
-		    *q == '|')
+		if (*q == '/' || *q == '\\' || *q == ':' || *q == '*' || *q == '?' || *q == '"' || *q == '<' ||
+		    *q == '>' || *q == '|')
 			*q = '_';
 	}
 
@@ -469,18 +456,274 @@ void odp_deck_subdir(const char *odp_path, const char *cache_dir,
 	dstr_free(&stem);
 }
 
-odp_export_result odp_export(const char *odp_path, const char *cache_dir,
-			     int dpi, int workers)
+/* ---- parallel PDF -> PNG rendering ------------------------------------- */
+
+/* Upper bound on concurrent pdftoppm processes, whatever the user asks for. */
+#define ODP_MAX_RENDER_JOBS 32
+
+/* One slice of the page range, rendered by its own pdftoppm process. */
+struct render_job {
+	const char *pdf;
+	const char *dir;
+	int dpi;
+	int first;
+	int last; /* 0 = render through to the end of the document */
+	int index;
+	int rc;
+	pthread_t thread;
+	bool started;
+};
+
+/* Render one slice. Each job writes with its OWN filename prefix (w0-, w1-,
+ * ...) so concurrent processes can never race on the same output file; the
+ * files are renamed to their canonical names afterwards. */
+static void *render_job_fn(void *param)
 {
-	return odp_export_range(odp_path, cache_dir, dpi, workers, 1, 0);
+	struct render_job *j = (struct render_job *)param;
+
+	char dpi_s[16], first_s[16], last_s[16];
+	snprintf(dpi_s, sizeof(dpi_s), "%d", j->dpi);
+	snprintf(first_s, sizeof(first_s), "%d", j->first);
+	snprintf(last_s, sizeof(last_s), "%d", j->last);
+
+	struct dstr prefix;
+	dstr_init(&prefix);
+	dstr_printf(&prefix, "%s/w%d", j->dir, j->index);
+
+	const char *argv[16];
+	int n = 0;
+	argv[n++] = odp_tool_pdftoppm();
+	argv[n++] = "-r";
+	argv[n++] = dpi_s;
+	argv[n++] = "-png";
+	if (j->first >= 1) {
+		argv[n++] = "-f";
+		argv[n++] = first_s;
+	}
+	if (j->last >= 1) {
+		argv[n++] = "-l";
+		argv[n++] = last_s;
+	}
+	argv[n++] = j->pdf;
+	argv[n++] = prefix.array;
+	argv[n] = NULL;
+
+	j->rc = run_argv(argv, NULL, NULL);
+	dstr_free(&prefix);
+	return NULL;
 }
 
-odp_export_result odp_export_range(const char *odp_path, const char *cache_dir,
-				   int dpi, int workers,
-				   int first_page, int last_page)
+/* If `name` looks like "w<job>-<page>.png", return <page>; otherwise 0. */
+static int worker_png_page(const char *name)
 {
-	UNUSED_PARAMETER(workers); /* parallelism added in next iteration */
+	if (!name || name[0] != 'w')
+		return 0;
+	const char *p = name + 1;
+	if (*p < '0' || *p > '9')
+		return 0;
+	while (*p >= '0' && *p <= '9')
+		p++;
+	if (*p != '-')
+		return 0;
+	p++;
+	if (*p < '0' || *p > '9')
+		return 0;
+	int page = atoi(p);
+	while (*p >= '0' && *p <= '9')
+		p++;
+	if (strcmp(p, ".png") != 0)
+		return 0;
+	return page;
+}
 
+/* Rename every wN-<page>.png produced by the render jobs to the canonical
+ * slide-<page>.png, zero-padded to one consistent width.
+ *
+ * This exists because pdftoppm pads page numbers to the width of the highest
+ * page in ITS OWN invocation — so parallel slices would otherwise disagree
+ * (slide-7.png from one chunk, slide-007.png from another). Normalising here
+ * means the rest of the plugin only ever sees one naming scheme, no matter how
+ * the work was divided or what pdftoppm decided to do.
+ *
+ * Returns the number of files renamed. */
+static int normalise_render_output(const char *dir, int total_pages)
+{
+	os_dir_t *d = os_opendir(dir);
+	if (!d)
+		return 0;
+
+	/* Collect first, rename after: mutating a directory while iterating it
+	 * is not portable. */
+	char **names = NULL;
+	size_t count = 0, cap = 0;
+	int max_page = total_pages > 0 ? total_pages : 0;
+
+	struct os_dirent *ent;
+	while ((ent = os_readdir(d)) != NULL) {
+		if (ent->directory)
+			continue;
+		int page = worker_png_page(ent->d_name);
+		if (page < 1)
+			continue;
+		if (count == cap) {
+			cap = cap ? cap * 2 : 64;
+			names = brealloc(names, cap * sizeof(char *));
+		}
+		names[count++] = bstrdup(ent->d_name);
+		if (page > max_page)
+			max_page = page;
+	}
+	os_closedir(d);
+
+	if (!count) {
+		bfree(names);
+		return 0;
+	}
+
+	int width = 1;
+	for (int n = max_page; n >= 10; n /= 10)
+		width++;
+
+	int moved = 0;
+	for (size_t i = 0; i < count; i++) {
+		int page = worker_png_page(names[i]);
+		struct dstr src, dst;
+		dstr_init(&src);
+		dstr_init(&dst);
+		dstr_printf(&src, "%s/%s", dir, names[i]);
+		dstr_printf(&dst, "%s/slide-%0*d.png", dir, width, page);
+		/* rename() will not replace an existing file on Windows. */
+		os_unlink(dst.array);
+		if (os_rename(src.array, dst.array) == 0)
+			moved++;
+		else
+			os_unlink(src.array); /* don't leave a stray wN- file */
+		dstr_free(&src);
+		dstr_free(&dst);
+		bfree(names[i]);
+	}
+	bfree(names);
+	return moved;
+}
+
+/* Page count of an existing PDF via `pdfinfo` (ships with poppler alongside
+ * pdftoppm). Returns 0 if it can't be determined. */
+static int pdf_page_count_at(const char *pdf_path)
+{
+	if (!pdf_path || !*pdf_path || !file_exists(pdf_path))
+		return 0;
+
+	const char *ppm = odp_tool_pdftoppm();
+	if (!ppm)
+		return 0;
+
+	/* pdfinfo lives next to pdftoppm. Keep the directory part and swap the
+	 * executable name (on Windows the ".exe" suffix matters — without it
+	 * file_exists() misses the bundled pdfinfo.exe and counting silently
+	 * fails). */
+	struct dstr info;
+	dstr_init_copy(&info, ppm);
+	char *slash = strrchr(info.array, '/');
+#if defined(_WIN32)
+	char *bslash = strrchr(info.array, '\\');
+	if (bslash && (!slash || bslash > slash))
+		slash = bslash;
+#endif
+	if (slash) {
+		*(slash + 1) = '\0';
+		dstr_resize(&info, strlen(info.array));
+#if defined(_WIN32)
+		dstr_cat(&info, "pdfinfo.exe");
+#else
+		dstr_cat(&info, "pdfinfo");
+#endif
+	}
+
+	int pages = 0;
+	if (file_exists(info.array)) {
+		const char *iargv[] = {info.array, pdf_path, NULL};
+		struct dstr out;
+		dstr_init(&out);
+		run_argv(iargv, &out, NULL);
+		if (out.array) {
+			const char *p = strstr(out.array, "Pages:");
+			if (p)
+				pages = atoi(p + 6);
+		}
+		dstr_free(&out);
+	}
+	dstr_free(&info);
+	return pages;
+}
+
+/* Number of usable cached slides for this deck, or 0 if a render is needed.
+ * Performs no rendering — it is cheap enough to call before deciding how to
+ * export. */
+static int cache_fresh_count(const char *work_dir, const char *odp_path, const char *pdf_path)
+{
+	int existing = count_pngs(work_dir);
+	if (existing <= 0)
+		return 0;
+
+	/* Slide 1 must be at least as new as the presentation, otherwise the
+	 * deck was edited after we rendered. Probe widest-padded name first. */
+	struct stat odp_st, png_st;
+	struct dstr first_png;
+	dstr_init(&first_png);
+	bool got_png = false;
+	for (int w = 6; w >= 1 && !got_png; w--) {
+		dstr_printf(&first_png, "%s/slide-%0*d.png", work_dir, w, 1);
+		if (stat(first_png.array, &png_st) == 0)
+			got_png = true;
+	}
+	dstr_free(&first_png);
+	if (!got_png)
+		return 0;
+	if (stat(odp_path, &odp_st) != 0 || png_st.st_mtime < odp_st.st_mtime)
+		return 0;
+
+	/* The cache must also be COMPLETE. Comparing the PNG count against the
+	 * PDF's real page count catches a half-finished render — a pdftoppm
+	 * that was killed, or the single page written by stage 1 of a staged
+	 * render — which would otherwise be mistaken for a whole deck (the
+	 * "reusing 9 cached slides" report for a 60-slide deck). */
+	int pages = pdf_page_count_at(pdf_path);
+	if (pages > 0 && existing != pages)
+		return 0;
+
+	return existing;
+}
+
+int odp_cached_slide_count(const char *odp_path, const char *cache_dir)
+{
+	if (!odp_path || !*odp_path || !cache_dir || !*cache_dir)
+		return 0;
+
+	char work[1024];
+	odp_deck_subdir(odp_path, cache_dir, work, sizeof(work));
+
+	/* work_dir ends in the deck's stem, and the PDF sits inside it under
+	 * that same stem — so the PDF path can be derived without recomputing
+	 * the stem. */
+	const char *stem = strrchr(work, '/');
+	if (!stem)
+		return 0;
+	struct dstr pdf;
+	dstr_init(&pdf);
+	dstr_printf(&pdf, "%s/%s.pdf", work, stem + 1);
+	int n = cache_fresh_count(work, odp_path, pdf.array);
+	dstr_free(&pdf);
+	return n;
+}
+
+odp_export_result odp_export(const char *odp_path, const char *cache_dir, int dpi, int workers)
+{
+	return odp_export_range(odp_path, cache_dir, dpi, workers, 1, 0, true);
+}
+
+odp_export_result odp_export_range(const char *odp_path, const char *cache_dir, int dpi, int workers, int first_page,
+				   int last_page, bool use_cache)
+{
 	odp_export_result res = {0};
 	res.ok = false;
 
@@ -493,8 +736,7 @@ odp_export_result odp_export_range(const char *odp_path, const char *cache_dir,
 		return res;
 	}
 	if (!odp_tool_libreoffice()) {
-		snprintf(res.error, sizeof(res.error),
-			 "LibreOffice not found");
+		snprintf(res.error, sizeof(res.error), "LibreOffice not found");
 		return res;
 	}
 
@@ -524,9 +766,8 @@ odp_export_result odp_export_range(const char *odp_path, const char *cache_dir,
 	if (dot)
 		*dot = '\0';
 	for (char *q = stem.array; q && *q; q++) {
-		if (*q == '/' || *q == '\\' || *q == ':' || *q == '*' ||
-		    *q == '?' || *q == '"' || *q == '<' || *q == '>' ||
-		    *q == '|')
+		if (*q == '/' || *q == '\\' || *q == ':' || *q == '*' || *q == '?' || *q == '"' || *q == '<' ||
+		    *q == '>' || *q == '|')
 			*q = '_';
 	}
 
@@ -539,44 +780,30 @@ odp_export_result odp_export_range(const char *odp_path, const char *cache_dir,
 	os_mkdirs(work.array);
 	const char *work_dir = work.array;
 
-	/* ── Fast path: reuse existing slides ────────────────────────────
-	 * If we already have slide PNGs that are newer than the source .odp,
-	 * the cache is current — skip the slow LibreOffice render and just
-	 * report the count. Widest-padded slide-1 name first, matching the
-	 * canonical full-deck render's padding. */
-	if (first_page <= 1 && last_page == 0) {
-		int existing = count_pngs(work_dir);
-		if (existing > 0) {
-			struct stat odp_st, png_st;
-			struct dstr first_png;
-			dstr_init(&first_png);
-			bool got_png = false;
-			for (int w = 6; w >= 1 && !got_png; w--) {
-				dstr_printf(&first_png, "%s/slide-%0*d.png",
-					    work_dir, w, 1);
-				if (stat(first_png.array, &png_st) == 0)
-					got_png = true;
-			}
-			if (got_png && stat(odp_path, &odp_st) == 0 &&
-			    png_st.st_mtime >= odp_st.st_mtime) {
-				res.ok = true;
-				res.slide_count = existing;
-				blog(LOG_INFO,
-				     "[odp-presenter] reusing %d cached slides "
-				     "for '%s' (no re-export needed)",
-				     existing, stem.array);
-				dstr_free(&first_png);
-				dstr_free(&stem);
-				dstr_free(&work);
-				return res;
-			}
-			dstr_free(&first_png);
-		}
-	}
-
 	struct dstr pdf_path;
 	dstr_init(&pdf_path);
 	dstr_printf(&pdf_path, "%s/%s.pdf", work_dir, stem.array);
+
+	/* ── Fast path: reuse existing slides ────────────────────────────
+	 * If the cached PNGs are newer than the source presentation AND there
+	 * are as many of them as the PDF has pages, the cache is current and
+	 * complete — skip LibreOffice and pdftoppm entirely and just report
+	 * the count. */
+	if (use_cache && first_page <= 1 && last_page == 0) {
+		int fresh = cache_fresh_count(work_dir, odp_path, pdf_path.array);
+		if (fresh > 0) {
+			res.ok = true;
+			res.slide_count = fresh;
+			blog(LOG_INFO,
+			     "[odp-presenter] reusing %d cached slides "
+			     "for '%s' (no re-export needed)",
+			     fresh, stem.array);
+			dstr_free(&stem);
+			dstr_free(&work);
+			dstr_free(&pdf_path);
+			return res;
+		}
+	}
 
 	/* Skip the (slow) LibreOffice conversion if a PDF already exists and is
 	 * at least as new as the .odp. This makes the tail render of the staged
@@ -585,9 +812,7 @@ odp_export_result odp_export_range(const char *odp_path, const char *cache_dir,
 	bool pdf_fresh = false;
 	{
 		struct stat pst, ost;
-		if (stat(pdf_path.array, &pst) == 0 &&
-		    stat(odp_path, &ost) == 0 &&
-		    pst.st_mtime >= ost.st_mtime)
+		if (stat(pdf_path.array, &pst) == 0 && stat(odp_path, &ost) == 0 && pst.st_mtime >= ost.st_mtime)
 			pdf_fresh = true;
 	}
 
@@ -667,16 +892,14 @@ odp_export_result odp_export_range(const char *odp_path, const char *cache_dir,
 		pthread_mutex_lock(&s_libreoffice_lock);
 		uint64_t t0 = os_gettime_ns();
 		int rc = run_argv(argv, NULL, NULL);
-		blog(LOG_INFO, "[odp-presenter] LibreOffice took %.1f s",
-		     (os_gettime_ns() - t0) / 1.0e9);
+		blog(LOG_INFO, "[odp-presenter] LibreOffice took %.1f s", (os_gettime_ns() - t0) / 1.0e9);
 		pthread_mutex_unlock(&s_libreoffice_lock);
 		dstr_free(&envarg);
 		dstr_free(&profdir);
 		dstr_free(&profile);
 		dstr_free(&logf);
 		if (rc != 0) {
-			snprintf(res.error, sizeof(res.error),
-				 "LibreOffice exit code %d", rc);
+			snprintf(res.error, sizeof(res.error), "LibreOffice exit code %d", rc);
 			dstr_free(&stem);
 			dstr_free(&pdf_path);
 			return res;
@@ -693,12 +916,10 @@ odp_export_result odp_export_range(const char *odp_path, const char *cache_dir,
 			while ((ent = os_readdir(d)) != NULL) {
 				if (ent->directory)
 					continue;
-				if (strncmp(ent->d_name, "slide-", 6) == 0 &&
-				    strstr(ent->d_name, ".png")) {
+				if (strncmp(ent->d_name, "slide-", 6) == 0 && strstr(ent->d_name, ".png")) {
 					struct dstr p;
 					dstr_init(&p);
-					dstr_printf(&p, "%s/%s", work_dir,
-						    ent->d_name);
+					dstr_printf(&p, "%s/%s", work_dir, ent->d_name);
 					os_unlink(p.array);
 					dstr_free(&p);
 				}
@@ -706,13 +927,11 @@ odp_export_result odp_export_range(const char *odp_path, const char *cache_dir,
 			os_closedir(d);
 		}
 	} else {
-		blog(LOG_INFO,
-		     "[odp-presenter] PDF already fresh, skipping LibreOffice");
+		blog(LOG_INFO, "[odp-presenter] PDF already fresh, skipping LibreOffice");
 	}
 
 	if (!file_exists(pdf_path.array)) {
-		snprintf(res.error, sizeof(res.error),
-			 "PDF not produced (%s)", pdf_path.array);
+		snprintf(res.error, sizeof(res.error), "PDF not produced (%s)", pdf_path.array);
 		dstr_free(&stem);
 		dstr_free(&work);
 		dstr_free(&pdf_path);
@@ -720,68 +939,122 @@ odp_export_result odp_export_range(const char *odp_path, const char *cache_dir,
 	}
 
 	if (!odp_tool_pdftoppm()) {
-		snprintf(res.error, sizeof(res.error),
-			 "pdftoppm not found");
+		snprintf(res.error, sizeof(res.error), "pdftoppm not found");
 		dstr_free(&stem);
 		dstr_free(&work);
 		dstr_free(&pdf_path);
 		return res;
 	}
 
-	struct dstr prefix;
-	dstr_init(&prefix);
-	dstr_printf(&prefix, "%s/slide", work_dir);
+	/* ── Stage 2: PDF -> PNGs, rendered in PARALLEL ──────────────────
+	 *
+	 * pdftoppm is single-threaded: one process rasterises pages one after
+	 * another, so a long deck spends nearly all of this stage using a
+	 * single core. Splitting the page range across `workers` processes puts
+	 * the whole CPU to work and is close to a linear speed-up here.
+	 *
+	 * (This is what the "Parallel render workers" setting always claimed to
+	 * do; until now the value was accepted and ignored.) */
+	int total_pages = pdf_page_count_at(pdf_path.array);
 
-	/* Build pdftoppm's arguments as a real vector (no shell). Numeric
-	 * arguments are rendered into small local buffers. */
-	char dpi_s[16], first_s[16], last_s[16];
-	snprintf(dpi_s, sizeof(dpi_s), "%d", dpi);
-	snprintf(first_s, sizeof(first_s), "%d", first_page);
-	snprintf(last_s, sizeof(last_s), "%d", last_page);
+	int lo = (first_page >= 1) ? first_page : 1;
+	int hi = (last_page >= 1) ? last_page : total_pages;
 
-	const char *rargv[16];
-	int n = 0;
-	rargv[n++] = odp_tool_pdftoppm();
-	rargv[n++] = "-r";
-	rargv[n++] = dpi_s;
-	rargv[n++] = "-png";
-	if (first_page >= 1) {
-		rargv[n++] = "-f";
-		rargv[n++] = first_s;
+	/* Without a page count and without an explicit last page there is
+	 * nothing to divide, so fall back to a single open-ended job that
+	 * renders through to the end of the document — exactly the old
+	 * behaviour, and still correct. */
+	bool open_ended = (hi < lo);
+
+	int njobs = workers;
+	if (njobs < 1)
+		njobs = 1;
+	if (njobs > ODP_MAX_RENDER_JOBS)
+		njobs = ODP_MAX_RENDER_JOBS;
+	if (open_ended)
+		njobs = 1;
+	else if (njobs > (hi - lo + 1))
+		njobs = hi - lo + 1;
+
+	struct render_job jobs[ODP_MAX_RENDER_JOBS];
+	memset(jobs, 0, sizeof(jobs));
+
+	int span = open_ended ? 0 : (hi - lo + 1);
+	int per = (span + njobs - 1) / njobs; /* ceiling division */
+
+	if (open_ended) {
+		jobs[0].pdf = pdf_path.array;
+		jobs[0].dir = work_dir;
+		jobs[0].dpi = dpi;
+		jobs[0].index = 0;
+		jobs[0].first = lo;
+		jobs[0].last = 0; /* through to the end of the document */
+		njobs = 1;
+	} else {
+		/* Ceiling division can exhaust the pages before the last worker
+		 * gets a slice (5 pages over 4 workers is 2 each, so the fourth
+		 * would start at page 7 of a 5-page deck). Stop as soon as a
+		 * slice would start past the end rather than handing pdftoppm a
+		 * backwards range, which it rejects — failing the whole render
+		 * and discarding a deck that was otherwise fine. */
+		int assigned = 0;
+		for (int i = 0; i < njobs; i++) {
+			int f = lo + i * per;
+			if (f > hi)
+				break;
+			int l = f + per - 1;
+			if (l > hi)
+				l = hi;
+			jobs[assigned].pdf = pdf_path.array;
+			jobs[assigned].dir = work_dir;
+			jobs[assigned].dpi = dpi;
+			jobs[assigned].index = assigned;
+			jobs[assigned].first = f;
+			jobs[assigned].last = l;
+			assigned++;
+		}
+		njobs = assigned;
 	}
-	if (last_page >= 1) {
-		rargv[n++] = "-l";
-		rargv[n++] = last_s;
-	}
-	rargv[n++] = pdf_path.array;
-	rargv[n++] = prefix.array;
-	rargv[n] = NULL;
 
 	uint64_t pt0 = os_gettime_ns();
-	int rc = run_argv(rargv, NULL, NULL);
-	blog(LOG_INFO,
-	     "[odp-presenter] pdftoppm (pages %d-%s) took %.1f s",
-	     first_page >= 1 ? first_page : 1,
-	     last_page >= 1 ? "range" : "end",
-	     (os_gettime_ns() - pt0) / 1.0e9);
-	dstr_free(&prefix);
 
-	/* If the render failed or was killed part-way (e.g. 0xC000013A when a
-	 * console window is closed), any PNGs it managed to write are an
-	 * INCOMPLETE deck. Leaving them behind poisons the cache: the next load
-	 * counts them and happily reports "reusing 9 cached slides" for a
-	 * 60-slide deck. Wipe them so the next attempt re-renders cleanly. */
+	/* Run job 0 on this thread, so a single worker costs no thread at all. */
+	for (int i = 1; i < njobs; i++) {
+		if (pthread_create(&jobs[i].thread, NULL, render_job_fn, &jobs[i]) == 0)
+			jobs[i].started = true;
+		else
+			jobs[i].rc = -1;
+	}
+	render_job_fn(&jobs[0]);
+	for (int i = 1; i < njobs; i++) {
+		if (jobs[i].started)
+			pthread_join(jobs[i].thread, NULL);
+	}
+
+	int rc = 0;
+	for (int i = 0; i < njobs; i++) {
+		if (jobs[i].rc != 0) {
+			rc = jobs[i].rc;
+			break;
+		}
+	}
+
+	/* Give every rendered page its canonical slide-NNN.png name. */
+	int produced = normalise_render_output(work_dir, total_pages);
+
+	blog(LOG_INFO, "[odp-presenter] rendered %d page(s) across %d worker(s) in %.1f s", produced, njobs,
+	     (os_gettime_ns() - pt0) / 1.0e9);
+
+	/* If any slice failed or was killed part-way, what survives is an
+	 * INCOMPLETE deck. Leaving it behind poisons the cache, so wipe it and
+	 * let the next attempt render cleanly. */
 	if (rc != 0) {
 		blog(LOG_WARNING,
 		     "[odp-presenter] render failed (code %d) — discarding "
 		     "partial slides so the cache isn't left incomplete",
 		     rc);
 		delete_slide_pngs(work_dir);
-	}
-
-	if (rc != 0) {
-		snprintf(res.error, sizeof(res.error),
-			 "pdftoppm exit code %d", rc);
+		snprintf(res.error, sizeof(res.error), "pdftoppm exit code %d", rc);
 		dstr_free(&stem);
 		dstr_free(&work);
 		dstr_free(&pdf_path);
@@ -791,42 +1064,7 @@ odp_export_result odp_export_range(const char *odp_path, const char *cache_dir,
 	res.slide_count = count_pngs(work_dir);
 	res.ok = res.slide_count > 0;
 	if (!res.ok)
-		snprintf(res.error, sizeof(res.error),
-			 "no PNGs produced");
-
-	/* After a FULL render, prune any slide PNG whose page-number width
-	 * doesn't match the canonical width, so a leftover narrow name can't
-	 * shadow the canonical one. Done AFTER the render so the live slide is
-	 * never momentarily missing. Operates within this deck's work_dir. */
-	if (res.ok && first_page <= 1 && last_page == 0) {
-		int canon_w = 1;
-		for (int n = res.slide_count; n >= 10; n /= 10)
-			canon_w++;
-		os_dir_t *d = os_opendir(work_dir);
-		if (d) {
-			struct os_dirent *ent;
-			while ((ent = os_readdir(d)) != NULL) {
-				if (ent->directory)
-					continue;
-				if (strncmp(ent->d_name, "slide-", 6) != 0 ||
-				    !strstr(ent->d_name, ".png"))
-					continue;
-				const char *num = ent->d_name + 6;
-				int w = 0;
-				while (num[w] >= '0' && num[w] <= '9')
-					w++;
-				if (w != canon_w) {
-					struct dstr p;
-					dstr_init(&p);
-					dstr_printf(&p, "%s/%s", work_dir,
-						    ent->d_name);
-					os_unlink(p.array);
-					dstr_free(&p);
-				}
-			}
-			os_closedir(d);
-		}
-	}
+		snprintf(res.error, sizeof(res.error), "no PNGs produced");
 
 	dstr_free(&stem);
 	dstr_free(&work);
@@ -834,84 +1072,25 @@ odp_export_result odp_export_range(const char *odp_path, const char *cache_dir,
 	return res;
 }
 
-
-/* Best-effort PDF page count via `pdfinfo` (ships with poppler alongside
- * pdftoppm). Returns 0 if it can't be determined. */
+/* Page count of the deck's cached PDF. Thin wrapper over pdf_page_count_at()
+ * that resolves the per-deck working folder first, so it agrees with where the
+ * exporter actually writes. */
 int odp_pdf_page_count(const char *odp_path, const char *cache_dir)
 {
-	if (!cache_dir || !*cache_dir)
+	if (!odp_path || !*odp_path || !cache_dir || !*cache_dir)
 		return 0;
 
-	/* derive PDF path (same stem as the odp) */
-	const char *base = strrchr(odp_path, '/');
-#if defined(_WIN32)
-	const char *base_bs = strrchr(odp_path, '\\');
-	if (base_bs && (!base || base_bs > base))
-		base = base_bs;
-#endif
-	base = base ? base + 1 : odp_path;
-	struct dstr stem;
-	dstr_init_copy(&stem, base);
-	char *dot = strrchr(stem.array, '.');
-	if (dot)
-		*dot = '\0';
+	char work[1024];
+	odp_deck_subdir(odp_path, cache_dir, work, sizeof(work));
 
-	struct dstr pdf_path;
-	dstr_init(&pdf_path);
-	dstr_printf(&pdf_path, "%s/%s.pdf", cache_dir, stem.array);
+	const char *stem = strrchr(work, '/');
+	if (!stem)
+		return 0;
 
-	int pages = 0;
-	if (file_exists(pdf_path.array)) {
-		/* Try pdfinfo next to pdftoppm. */
-		const char *ppm = odp_tool_pdftoppm();
-		if (ppm) {
-			struct dstr info;
-			dstr_init_copy(&info, ppm);
-			/* Swap the trailing "pdftoppm" for "pdfinfo", keeping the
-			 * directory part. On Windows the path may use backslashes
-			 * (so check both separators) and the executable needs the
-			 * ".exe" suffix — without it file_exists() misses the
-			 * bundled pdfinfo.exe and page counting silently fails. */
-			char *slash = strrchr(info.array, '/');
-#if defined(_WIN32)
-			char *bslash = strrchr(info.array, '\\');
-			if (bslash && (!slash || bslash > slash))
-				slash = bslash;
-#endif
-			if (slash) {
-				*(slash + 1) = '\0';
-				dstr_resize(&info, strlen(info.array));
-#if defined(_WIN32)
-				dstr_cat(&info, "pdfinfo.exe");
-#else
-				dstr_cat(&info, "pdfinfo");
-#endif
-			}
-			if (file_exists(info.array)) {
-				/* Run pdfinfo through the same shell-free path
-				 * and capture its stdout, then find the Pages:
-				 * line. */
-				const char *iargv[] = {
-					info.array,
-					pdf_path.array,
-					NULL,
-				};
-				struct dstr out;
-				dstr_init(&out);
-				run_argv(iargv, &out, NULL);
-				if (out.array) {
-					const char *p = strstr(out.array,
-							       "Pages:");
-					if (p)
-						pages = atoi(p + 6);
-				}
-				dstr_free(&out);
-			}
-			dstr_free(&info);
-		}
-	}
-
-	dstr_free(&stem);
-	dstr_free(&pdf_path);
+	struct dstr pdf;
+	dstr_init(&pdf);
+	dstr_printf(&pdf, "%s/%s.pdf", work, stem + 1);
+	int pages = pdf_page_count_at(pdf.array);
+	dstr_free(&pdf);
 	return pages;
 }

@@ -30,7 +30,7 @@
 /* ---- per-instance state ------------------------------------------------ */
 
 struct odp_source {
-	obs_source_t *self;        /* the source OBS gave us */
+	obs_source_t *self; /* the source OBS gave us */
 
 	/* --- Off-thread slide decode/display ---------------------------------
 	 * The dropped frame was caused by OBS's image_source decoding the PNG
@@ -47,32 +47,32 @@ struct odp_source {
 	 *                    into `tex` (fast), then draw `tex`
 	 *
 	 * All the pending_* fields and want_index are guarded by decode_lock. */
-	pthread_t       decode_thread;
-	bool            decode_started;   /* decode_thread is joinable */
-	bool            decode_exit;      /* ask decode_thread to exit (destroy) */
+	pthread_t decode_thread;
+	bool decode_started; /* decode_thread is joinable */
+	bool decode_exit;    /* ask decode_thread to exit (destroy) */
 	pthread_mutex_t decode_lock;
-	pthread_cond_t  decode_cond;
-	int             want_index;       /* slide the decode thread should load */
-	int             decoded_index;    /* slide currently in pending buffer */
+	pthread_cond_t decode_cond;
+	int want_index;    /* slide the decode thread should load */
+	int decoded_index; /* slide currently in pending buffer */
 
 	/* Handoff buffer: raw pixels produced by the decode thread. */
-	uint8_t        *pending_data;     /* bmalloc'd RGBA pixels, or NULL */
-	uint32_t        pending_cx;
-	uint32_t        pending_cy;
+	uint8_t *pending_data; /* bmalloc'd RGBA pixels, or NULL */
+	uint32_t pending_cx;
+	uint32_t pending_cy;
 	enum gs_color_format pending_format;
-	bool            pending_ready;    /* a new buffer awaits GPU upload */
+	bool pending_ready; /* a new buffer awaits GPU upload */
 
 	/* Graphics-thread-owned texture (only touched in render). */
-	gs_texture_t   *tex;
-	int             tex_index;        /* slide currently uploaded to `tex` */
-	uint32_t        tex_cx;
-	uint32_t        tex_cy;
+	gs_texture_t *tex;
+	int tex_index; /* slide currently uploaded to `tex` */
+	uint32_t tex_cx;
+	uint32_t tex_cy;
 
-	int shown_index;          /* slide last presented (for tick comparison) */
+	int shown_index; /* slide last presented (for tick comparison) */
 
 	/* settings */
-	struct dstr odp_path;      /* path to the .odp file */
-	struct dstr cache_dir;     /* where slide PNGs are written */
+	struct dstr odp_path;  /* path to the .odp file */
+	struct dstr cache_dir; /* where slide PNGs are written */
 	int dpi;
 	int workers;
 
@@ -89,8 +89,8 @@ struct odp_source {
 	pthread_mutex_t lock;
 
 	/* auto-refresh: poll the .odp mtime and re-export when it changes */
-	time_t odp_mtime;        /* last-seen modification time of the .odp */
-	float  poll_accum;       /* seconds accumulated toward next poll */
+	time_t odp_mtime; /* last-seen modification time of the .odp */
+	float poll_accum; /* seconds accumulated toward next poll */
 
 	/* hotkeys */
 	obs_hotkey_id hk_next;
@@ -149,8 +149,7 @@ static void slide_png_path(struct odp_source *s, int index1, struct dstr *out)
 	 * PNGs written for THIS presentation, never another deck's that shares
 	 * the cache folder. */
 	char deck[1024];
-	odp_deck_subdir(s->odp_path.array ? s->odp_path.array : "",
-			s->cache_dir.array ? s->cache_dir.array : "", deck,
+	odp_deck_subdir(s->odp_path.array ? s->odp_path.array : "", s->cache_dir.array ? s->cache_dir.array : "", deck,
 			sizeof(deck));
 
 	/* Probe widest-first: pdftoppm pads page numbers to the width of the
@@ -221,8 +220,7 @@ static void *decode_thread_fn(void *param)
 		/* Decode with STRAIGHT alpha: obs_source_draw() uses the default
 		 * (non-premultiplied) effect, so the pixel data must be straight
 		 * alpha or the image draws wrong (e.g. black). */
-		uint8_t *data = gs_create_texture_file_data2(
-			path.array, GS_IMAGE_ALPHA_STRAIGHT, &fmt, &cx, &cy);
+		uint8_t *data = gs_create_texture_file_data2(path.array, GS_IMAGE_ALPHA_STRAIGHT, &fmt, &cx, &cy);
 		dstr_free(&path);
 
 		pthread_mutex_lock(&s->decode_lock);
@@ -241,16 +239,13 @@ static void *decode_thread_fn(void *param)
 			s->pending_format = fmt;
 			s->pending_ready = true;
 			s->decoded_index = idx;
-			blog(LOG_DEBUG,
-			     "[odp-presenter] decoded slide %d (%ux%u)",
-			     idx, cx, cy);
+			blog(LOG_DEBUG, "[odp-presenter] decoded slide %d (%ux%u)", idx, cx, cy);
 		} else {
 			if (data)
 				bfree(data);
 			/* Mark as "done" so we don't spin retrying a bad file. */
 			s->decoded_index = idx;
-			blog(LOG_WARNING,
-			     "[odp-presenter] decode failed for slide %d", idx);
+			blog(LOG_WARNING, "[odp-presenter] decode failed for slide %d", idx);
 		}
 		/* Loop: if want_index changed again while we decoded, we'll
 		 * pick it up on the next iteration. */
@@ -260,6 +255,43 @@ static void *decode_thread_fn(void *param)
 }
 
 /* ---- export worker thread --------------------------------------------- */
+
+/* Make `count` slides live for the source.
+ *
+ * Called once per render stage: after stage 1 a single slide is displayable,
+ * after stage 2 the whole deck is. `mark_fresh` records the presentation's
+ * modification time, marking the cache as matching the file on disk — only
+ * done once the deck is COMPLETE, so an interrupted render is retried rather
+ * than mistaken for finished work.
+ */
+static void publish_slides(struct odp_source *s, int count, bool mark_fresh, const char *odp_path)
+{
+	if (count < 1)
+		return;
+
+	pthread_mutex_lock(&s->lock);
+	s->slide_count = count;
+	if (s->current_index < 1)
+		s->current_index = 1;
+	s->shown_index = 0; /* force video_tick to (re)request the slide */
+	pthread_mutex_unlock(&s->lock);
+
+	/* The PNGs were (re)generated, so the decode thread's cached
+	 * decoded_index is now stale. Reset it under decode_lock so the next
+	 * request re-decodes the fresh bytes even if the index is unchanged
+	 * (the refresh-after-edit case). */
+	pthread_mutex_lock(&s->decode_lock);
+	s->decoded_index = 0;
+	pthread_mutex_unlock(&s->decode_lock);
+
+	if (mark_fresh) {
+		struct stat st;
+		time_t mt = (stat(odp_path, &st) == 0) ? st.st_mtime : 0;
+		pthread_mutex_lock(&s->lock);
+		s->odp_mtime = mt;
+		pthread_mutex_unlock(&s->lock);
+	}
+}
 
 static void *export_thread(void *param)
 {
@@ -318,14 +350,12 @@ static void *export_thread(void *param)
 			const char *tmp = getenv("TMPDIR");
 			if (!tmp || !*tmp)
 				tmp = "/tmp";
-			dstr_printf(&cache, "%s/obs_odp_slides/%s", tmp,
-				    stem.array);
+			dstr_printf(&cache, "%s/obs_odp_slides/%s", tmp, stem.array);
 		}
 		bfree(cfg);
 		dstr_free(&stem);
 
-		blog(LOG_INFO, "[odp-presenter] no cache dir set, using '%s'",
-		     cache.array);
+		blog(LOG_INFO, "[odp-presenter] no cache dir set, using '%s'", cache.array);
 		/* Persist the resolved default back to the source so the render
 		 * path (slide_png_path) looks in the SAME folder we export to. */
 		pthread_mutex_lock(&s->lock);
@@ -334,57 +364,61 @@ static void *export_thread(void *param)
 	}
 
 	if (os_mkdirs(cache.array) < 0) {
-		blog(LOG_ERROR, "[odp-presenter] could not create cache dir '%s'",
-		     cache.array);
+		blog(LOG_ERROR, "[odp-presenter] could not create cache dir '%s'", cache.array);
 		s->worker_running = false;
 		dstr_free(&odp);
 		dstr_free(&cache);
 		return NULL;
 	}
 
-	blog(LOG_INFO, "[odp-presenter] exporting '%s' -> '%s'",
-	     odp.array, cache.array);
+	blog(LOG_INFO, "[odp-presenter] exporting '%s' -> '%s'", odp.array, cache.array);
 
-	/* Render strategy: a single full-deck render. pdftoppm rasterises the
-	 * entire deck in ONE process (far faster than one process per page),
-	 * and odp_export_range handles the slow ODP->PDF LibreOffice step only
-	 * when the .odp is newer than the cached PDF. When LibreOffice does
-	 * re-run, it first clears stale slide PNGs so a shortened deck (e.g.
-	 * 156 -> 60 slides) can't leave orphaned pages behind. */
+	/* ── Render strategy: two stages, so a slide appears FAST ────────
+	 *
+	 * A full deck takes a while to rasterise, and until it finished the
+	 * source showed nothing at all — the whole deck had to render before
+	 * anything appeared on screen. Instead:
+	 *
+	 *   Stage 1  render page 1 only. This still pays the (unavoidable)
+	 *            LibreOffice ODP->PDF conversion, but rasterises a single
+	 *            page, so the first slide appears almost as soon as the
+	 *            PDF exists instead of minutes later.
+	 *
+	 *   Stage 2  render the whole deck, split across `workers` parallel
+	 *            pdftoppm processes. The PDF is already fresh by now, so
+	 *            LibreOffice is skipped entirely and stage 1's page is
+	 *            simply rewritten under the same canonical name.
+	 *
+	 * When the cache is already complete both stages are skipped and the
+	 * slides are published immediately. */
+	odp_export_result r = {0};
+	int cached = odp_cached_slide_count(odp.array, cache.array);
 
-	/* Single full-deck render. pdftoppm rasterises the whole deck in one
-	 * process, which on a ~60-slide deck is only a few seconds — not worth
-	 * the complexity (and cache-coherence bugs) of a separate focus batch.
-	 * odp_export_range clears stale PNGs and re-runs LibreOffice whenever
-	 * the .odp is newer than the cache, so edits always re-render fully. */
-	odp_export_result r = odp_export_range(odp.array, cache.array, dpi,
-					       workers, 1, 0);
-
-	if (r.ok) {
-		struct stat st;
-		time_t mt = (stat(odp.array, &st) == 0) ? st.st_mtime : 0;
-		pthread_mutex_lock(&s->lock);
-		s->slide_count = r.slide_count;
-		if (s->current_index < 1)
-			s->current_index = 1;
-		s->shown_index = 0; /* force video_tick to (re)request the slide */
-		pthread_mutex_unlock(&s->lock);
-		/* The PNGs were (re)generated, so the decode thread's cached
-		 * decoded_index is now stale. Reset it under decode_lock so the
-		 * next request re-decodes the fresh bytes even if the index is
-		 * unchanged (the refresh-after-edit case). */
-		pthread_mutex_lock(&s->decode_lock);
-		s->decoded_index = 0;
-		pthread_mutex_unlock(&s->decode_lock);
-		pthread_mutex_lock(&s->lock);
-		s->odp_mtime = mt;
-		pthread_mutex_unlock(&s->lock);
-		blog(LOG_INFO,
-		     "[odp-presenter] full deck ready: %d slides",
-		     r.slide_count);
+	if (cached > 0) {
+		blog(LOG_INFO, "[odp-presenter] %d cached slides ready", cached);
+		publish_slides(s, cached, true, odp.array);
+		r.ok = true;
+		r.slide_count = cached;
 	} else {
-		blog(LOG_ERROR, "[odp-presenter] export failed: %s", r.error);
+		/* Stage 1 and stage 2 both pass use_cache = false: this thread has
+		 * already established (above) that the cache is not complete, and
+		 * stage 2 must never mistake the single page stage 1 just wrote
+		 * for a finished deck. */
+		odp_export_result first = odp_export_range(odp.array, cache.array, dpi, workers, 1, 1, false);
+		if (first.ok) {
+			publish_slides(s, first.slide_count, false, odp.array);
+			blog(LOG_INFO, "[odp-presenter] first slide ready — rendering the rest");
+		}
+
+		r = odp_export_range(odp.array, cache.array, dpi, workers, 1, 0, false);
+		if (r.ok) {
+			publish_slides(s, r.slide_count, true, odp.array);
+			blog(LOG_INFO, "[odp-presenter] full deck ready: %d slides", r.slide_count);
+		}
 	}
+
+	if (!r.ok)
+		blog(LOG_ERROR, "[odp-presenter] export failed: %s", r.error);
 
 	dstr_free(&odp);
 	dstr_free(&cache);
@@ -429,11 +463,20 @@ static void odp_navigate(struct odp_source *s, int action)
 		return;
 	int idx = s->current_index;
 	switch (action) {
-	case 0: idx++; break;
-	case 1: idx--; break;
-	case 2: idx = 1; break;
-	case 3: idx = s->slide_count; break;
-	default: return;
+	case 0:
+		idx++;
+		break;
+	case 1:
+		idx--;
+		break;
+	case 2:
+		idx = 1;
+		break;
+	case 3:
+		idx = s->slide_count;
+		break;
+	default:
+		return;
 	}
 	/* Clamp HERE, before storing, so pressing Forward on the last slide
 	 * (or Back on the first) leaves current_index unchanged. Otherwise the
@@ -473,8 +516,7 @@ static bool source_is_in_preview_scene(struct odp_source *s);
  * The dock and hotkey entry points are thin wrappers around this. */
 typedef bool (*scene_picker_fn)(struct odp_source *);
 
-static void odp_navigate_in_scene(int action, scene_picker_fn picker,
-				   const char *which)
+static void odp_navigate_in_scene(int action, scene_picker_fn picker, const char *which)
 {
 	/* Snapshot the current sources under the lock, then release it BEFORE
 	 * calling the picker, which calls into the OBS frontend API. Holding
@@ -590,8 +632,7 @@ static bool source_is_in_active_scene(struct odp_source *s)
 	return found;
 }
 
-static void hk_cb(void *data, obs_hotkey_id id, obs_hotkey_t *hotkey,
-		  bool pressed)
+static void hk_cb(void *data, obs_hotkey_id id, obs_hotkey_t *hotkey, bool pressed)
 {
 	UNUSED_PARAMETER(hotkey);
 	if (!pressed)
@@ -663,20 +704,14 @@ static void *odp_create(obs_data_t *settings, obs_source_t *source)
 	if (pthread_create(&s->decode_thread, NULL, decode_thread_fn, s) == 0)
 		s->decode_started = true;
 	else
-		blog(LOG_ERROR,
-		     "[odp-presenter] failed to start decode thread");
+		blog(LOG_ERROR, "[odp-presenter] failed to start decode thread");
 
 	/* Register hotkeys bound to this source instance. */
-	s->hk_next = obs_hotkey_register_source(
-		source, "odp.next", "Next Slide", hk_cb, s);
-	s->hk_prev = obs_hotkey_register_source(
-		source, "odp.prev", "Previous Slide", hk_cb, s);
-	s->hk_first = obs_hotkey_register_source(
-		source, "odp.first", "First Slide", hk_cb, s);
-	s->hk_last = obs_hotkey_register_source(
-		source, "odp.last", "Last Slide", hk_cb, s);
-	s->hk_refresh = obs_hotkey_register_source(
-		source, "odp.refresh", "Reload from disk", hk_cb, s);
+	s->hk_next = obs_hotkey_register_source(source, "odp.next", "Next Slide", hk_cb, s);
+	s->hk_prev = obs_hotkey_register_source(source, "odp.prev", "Previous Slide", hk_cb, s);
+	s->hk_first = obs_hotkey_register_source(source, "odp.first", "First Slide", hk_cb, s);
+	s->hk_last = obs_hotkey_register_source(source, "odp.last", "Last Slide", hk_cb, s);
+	s->hk_refresh = obs_hotkey_register_source(source, "odp.refresh", "Reload from disk", hk_cb, s);
 
 	odp_update(s, settings);
 	return s;
@@ -768,9 +803,7 @@ static void odp_video_tick(void *data, float seconds)
 
 	struct stat st;
 	if (stat(path_copy, &st) == 0 && st.st_mtime > baseline) {
-		blog(LOG_INFO,
-		     "[odp-presenter] '%s' changed on disk, re-exporting",
-		     path_copy);
+		blog(LOG_INFO, "[odp-presenter] '%s' changed on disk, re-exporting", path_copy);
 		/* Bump baseline immediately so we don't fire repeatedly while the
 		 * re-export runs. The worker will set the authoritative value. */
 		pthread_mutex_lock(&s->lock);
@@ -810,16 +843,14 @@ static void odp_video_render(void *data, gs_effect_t *effect)
 			gs_texture_destroy(s->tex);
 			s->tex = NULL;
 		}
-		const uint8_t *datas[1] = { data_buf };
+		const uint8_t *datas[1] = {data_buf};
 		s->tex = gs_texture_create(cx, cy, fmt, 1, datas, 0);
 		s->tex_cx = cx;
 		s->tex_cy = cy;
 		s->tex_index = idx;
 
 		bfree(data_buf);
-		blog(LOG_DEBUG,
-		     "[odp-presenter] uploaded slide %d (%ux%u)",
-		     idx, cx, cy);
+		blog(LOG_DEBUG, "[odp-presenter] uploaded slide %d (%ux%u)", idx, cx, cy);
 	} else {
 		pthread_mutex_unlock(&s->decode_lock);
 	}
@@ -831,8 +862,7 @@ static void odp_video_render(void *data, gs_effect_t *effect)
 	 * effect's "image" param and run the Draw technique over a sprite. */
 	if (s->tex) {
 		gs_effect_t *eff = obs_get_base_effect(OBS_EFFECT_DEFAULT);
-		gs_eparam_t *image =
-			gs_effect_get_param_by_name(eff, "image");
+		gs_eparam_t *image = gs_effect_get_param_by_name(eff, "image");
 		gs_effect_set_texture(image, s->tex);
 		while (gs_effect_loop(eff, "Draw"))
 			gs_draw_sprite(s->tex, 0, s->tex_cx, s->tex_cy);
@@ -860,23 +890,19 @@ static obs_properties_t *odp_get_properties(void *data)
 	 * surface a clear, actionable message right at the top of the source's
 	 * settings rather than letting the source silently stay blank. */
 	if (!odp_tool_libreoffice()) {
-		obs_property_t *warn = obs_properties_add_text(
-			props, "lo_missing_warning",
-			"LibreOffice was not found. This plugin needs "
-			"LibreOffice to convert slides. Install it (free) "
-			"from libreoffice.org, then reopen this source.",
-			OBS_TEXT_INFO);
+		obs_property_t *warn = obs_properties_add_text(props, "lo_missing_warning",
+							       "LibreOffice was not found. This plugin needs "
+							       "LibreOffice to convert slides. Install it (free) "
+							       "from libreoffice.org, then reopen this source.",
+							       OBS_TEXT_INFO);
 		obs_property_text_set_info_type(warn, OBS_TEXT_INFO_WARNING);
 	}
 
-	obs_properties_add_path(props, "odp_path", "Presentation file",
-				OBS_PATH_FILE,
+	obs_properties_add_path(props, "odp_path", "Presentation file", OBS_PATH_FILE,
 				"Presentations (*.odp *.pptx *.ppt)", NULL);
-	obs_properties_add_path(props, "cache_dir", "Slide cache folder",
-				OBS_PATH_DIRECTORY, NULL, NULL);
+	obs_properties_add_path(props, "cache_dir", "Slide cache folder", OBS_PATH_DIRECTORY, NULL, NULL);
 	obs_properties_add_int(props, "dpi", "Render DPI", 72, 400, 1);
-	obs_properties_add_int(props, "workers", "Parallel render workers",
-			       1, 16, 1);
+	obs_properties_add_int(props, "workers", "Parallel render workers", 1, 16, 1);
 
 	return props;
 }

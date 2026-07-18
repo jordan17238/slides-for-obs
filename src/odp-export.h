@@ -20,9 +20,9 @@ extern "C" {
 
 /* Result of an export: how many slide PNGs were produced. */
 typedef struct {
-	int slide_count;     /* number of slide-XXXX.png files on success */
-	bool ok;             /* false if LibreOffice or the renderer failed */
-	char error[512];     /* human-readable error if !ok */
+	int slide_count; /* number of slide-XXXX.png files on success */
+	bool ok;         /* false if LibreOffice or the renderer failed */
+	char error[512]; /* human-readable error if !ok */
 } odp_export_result;
 
 /*
@@ -44,10 +44,7 @@ const char *odp_tool_pdftoppm(void);
  * Incremental: pages whose source hasn't changed since last call are
  * skipped (compared via per-page hashing), exactly like the Python build.
  */
-odp_export_result odp_export(const char *odp_path,
-			     const char *cache_dir,
-			     int dpi,
-			     int workers);
+odp_export_result odp_export(const char *odp_path, const char *cache_dir, int dpi, int workers);
 
 /*
  * Staged variant for fast first-paint. Renders only PDF pages
@@ -61,16 +58,22 @@ odp_export_result odp_export(const char *odp_path,
  * On success, slide_count reports the TOTAL number of slide PNGs currently
  * present in cache_dir (not just the range rendered this call).
  */
-odp_export_result odp_export_range(const char *odp_path,
-				   const char *cache_dir,
-				   int dpi,
-				   int workers,
-				   int first_page,
-				   int last_page);
+odp_export_result odp_export_range(const char *odp_path, const char *cache_dir, int dpi, int workers, int first_page,
+				   int last_page, bool use_cache);
 
 /* Returns the page count of the most recently produced PDF in cache_dir,
  * or 0 if none/unknown. Cheap; reads the PDF only. */
 int odp_pdf_page_count(const char *odp_path, const char *cache_dir);
+
+/*
+ * Number of usable cached slides for this deck, or 0 if a render is needed.
+ *
+ * Renders nothing — it only inspects what is already on disk, so it is cheap
+ * enough to call before deciding HOW to export. A deck only counts as cached
+ * if its slides are newer than the presentation AND there are as many of them
+ * as the PDF has pages, so a half-finished render never passes as a whole one.
+ */
+int odp_cached_slide_count(const char *odp_path, const char *cache_dir);
 
 /*
  * Compute the per-deck working subfolder for a presentation: cache_dir plus a
@@ -81,8 +84,7 @@ int odp_pdf_page_count(const char *odp_path, const char *cache_dir);
  *
  * Writes the full path into `out` (a char buffer) up to out_size bytes.
  */
-void odp_deck_subdir(const char *odp_path, const char *cache_dir,
-		     char *out, size_t out_size);
+void odp_deck_subdir(const char *odp_path, const char *cache_dir, char *out, size_t out_size);
 
 #ifdef __cplusplus
 }
