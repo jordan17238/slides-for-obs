@@ -27,6 +27,10 @@
 #ifndef DistDir
   #define DistDir "dist\slides-for-obs"
 #endif
+; Newline for MsgBox strings. Using a define avoids Pascal source lines that
+; begin with '#' (e.g. a continuation starting with #13#10), which Inno's
+; preprocessor would try to read as a directive and abort on.
+#define NL "#13#10"
 
 [Setup]
 AppId={{B7E9F1C2-3A4D-4E5F-9A8B-0C1D2E3F4A5B}
@@ -118,10 +122,10 @@ begin
   ObsDir := DetectObsDir();
   if ObsDir = '' then
   begin
-    if MsgBox('OBS Studio was not found in the usual locations.' #13#10
-              + 'Please make sure OBS Studio is installed before installing '
-              + 'this plugin.' #13#10#13#10
-              + 'Continue anyway using the default OBS folder?',
+    if MsgBox('OBS Studio was not found in the usual locations.' {#NL}
+              'Please make sure OBS Studio is installed before installing '
+              'this plugin.' {#NL}{#NL}
+              'Continue anyway using the default OBS folder?',
               mbConfirmation, MB_YESNO) = IDYES then
       ObsDir := ExpandConstant('{commonpf64}\obs-studio')
     else
@@ -134,11 +138,11 @@ begin
   { Refuse to run while OBS is open - the plugin DLL would be locked. }
   while IsObsRunning() do
   begin
-    if MsgBox('OBS Studio is currently running.' #13#10
-              + 'Please close OBS completely, then click Retry to continue.'
-              #13#10#13#10
-              + '(Installing while OBS is open would fail to replace the '
-              + 'plugin file.)',
+    if MsgBox('OBS Studio is currently running.' {#NL}
+              'Please close OBS completely, then click Retry to continue.' {#NL}
+              '' {#NL}
+              '(Installing while OBS is open would fail to replace the '
+              'plugin file.)',
               mbError, MB_RETRYCANCEL) = IDCANCEL then
     begin
       Result := False;
@@ -164,11 +168,11 @@ begin
   begin
     if not LibreOfficeInstalled() then
     begin
-      if MsgBox('Slides for OBS was installed successfully.' #13#10#13#10
-                + 'However, LibreOffice was not found on this computer. The '
-                + 'plugin needs LibreOffice (free) to convert your slides - '
-                + 'without it, presentations will not render.' #13#10#13#10
-                + 'Open the LibreOffice download page now?',
+      if MsgBox('Slides for OBS was installed successfully.' {#NL}{#NL}
+                'However, LibreOffice was not found on this computer. The '
+                'plugin needs LibreOffice (free) to convert your slides - '
+                'without it, presentations will not render.' {#NL}{#NL}
+                'Open the LibreOffice download page now?',
                 mbInformation, MB_YESNO) = IDYES then
         ShellExec('open', 'https://www.libreoffice.org/download/download/',
                   '', '', SW_SHOW, ewNoWait, ErrCode);
