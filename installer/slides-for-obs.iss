@@ -96,7 +96,7 @@ begin
   if DirExists(P) then begin Result := P; exit; end;
 end;
 
-{ Exposed to [Files]/[UninstallDelete] via {code:GetObsDir}. }
+{ Exposed to the [Files] and [UninstallDelete] sections via code:GetObsDir. }
 function GetObsDir(Param: String): String;
 begin
   Result := ObsDir;
