@@ -1,0 +1,65 @@
+# Publishes a GitHub Release when a version tag (e.g. v0.1.0) is pushed.
+#
+# It waits for the plugin build and the installer build to produce their
+# artifacts for the tagged commit, gathers them, and attaches them to a
+# Release so users can download a single installer instead of digging through
+# CI artifacts.
+#
+# Usage:
+#   git tag v0.1.0
+#   git push origin v0.1.0
+#
+# The Windows installer is built by installer.yaml (triggered by the plugin
+# build). This workflow downloads that installer artifact and the macOS/Linux
+# plugin artifacts, then creates the Release.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write # needed to create a Release
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Wait for build workflows to finish
+        uses: lewagon/wait-on-check-action@v1.3.4
+        with:
+          ref: ${{ github.sha }}
+          running-workflow-name: release
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          wait-interval: 20
+        continue-on-error: true
+
+      - name: Download all artifacts for this commit
+        uses: actions/download-artifact@v4
+        with:
+          path: release-files
+          merge-multiple: true
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+        continue-on-error: true
+
+      - name: Show what we gathered
+        run: |
+          echo "Files staged for release:"
+          find release-files -type f 2>/dev/null || echo "(none found yet)"
+
+      - name: Create the release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          generate_release_notes: true
+          draft: true # review before publishing
+          files: |
+            release-files/**/SlidesForOBS-Setup.exe
+            release-files/**/*.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

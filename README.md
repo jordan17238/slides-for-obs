@@ -1,81 +1,94 @@
-# ODP Presenter — Native OBS Plugin (work in progress)
+# Slides for OBS
 
-This is the native C plugin port of the Python `obs_odp_presenter.py` script.
-It registers a real **"ODP Presentation"** source type in OBS, so end users
-just Add Source → ODP Presentation, pick a file, and go — no Python, no
-interpreter path, no manual script loading.
+Display LibreOffice Impress (`.odp`) and PowerPoint (`.pptx`) presentations
+directly inside OBS Studio as a native source — no window capture, no
+second screen, no PowerPoint running in the background.
 
-## Current status
+The plugin converts each deck to images once (via LibreOffice) and shows them
+as a normal OBS source you can position, resize, and switch between. Slide
+navigation is frame-accurate and doesn't drop frames on your stream.
 
-**Milestone 1 (this code):** loads as a plugin, registers the source type,
-runs the LibreOffice → PDF → PNG pipeline on a background thread, displays
-slides via an internal image source, and supports next/prev/first/last/reload
-hotkeys.
+## Features
 
-**Not yet ported from the Python version:**
-- Incremental rendering (per-page hashing to skip unchanged slides)
-- Parallel page rendering (currently one pdftoppm call for the whole PDF)
-- Fixed 4-digit filename normalisation
-- Scene-aware "active deck" arrow keys (native hotkeys are per-source, which
-  actually solves this more cleanly — each source has its own hotkeys)
+- **Native source** — slides render straight into the scene, not captured
+  from another window.
+- **`.odp` and `.pptx`** — anything LibreOffice can open.
+- **On-screen navigation dock** — separate *Live* and *Preview* controls, so
+  you can queue the next slide without disturbing what's on air.
+- **Automatic refresh** — edit the deck, save, and the slides update.
+- **Multiple decks at once** — several presentation sources side by side, each
+  independent.
+- **Parallel rendering** — uses multiple CPU cores to convert long decks
+  quickly. Conversion happens once and is cached, so later loads are instant.
 
-These come in milestone 2 once milestone 1 compiles and loads for you.
+## Requirements
 
-## Why it still needs LibreOffice
+- **OBS Studio 30 or newer** (64-bit).
+- **[LibreOffice](https://www.libreoffice.org/download/download/)** — free,
+  and required to convert presentations. The plugin cannot render slides
+  without it. If it's missing, the installer will point you to the download.
 
-There is no good native library to render `.odp`. Like the script, the plugin
-shells out to a headless LibreOffice to make a PDF, then rasterises with
-pdftoppm. Your users install LibreOffice (and on Windows, poppler) once —
-everything else is bundled in the plugin.
+LibreOffice does not need to be running; the plugin calls it in the background
+only when converting a deck.
 
-## Building
+## Installation (Windows)
 
-The easiest path is to build inside the official OBS plugin template, which
-provides libobs discovery, packaging, signing hooks, and GitHub Actions CI for
-both macOS and Windows:
+1. Download `SlidesForOBS-Setup.exe` from the
+   [latest release](../../releases/latest).
+2. Close OBS Studio if it's open.
+3. Run the installer. It finds your OBS folder automatically and installs the
+   plugin. Running it again later updates an existing install.
+4. Start OBS. Add a source: **Slides for OBS → ODP Presentation**, and pick
+   your `.odp` or `.pptx` file.
 
-1. Clone the template:
-   ```
-   git clone https://github.com/obsproject/obs-plugintemplate.git
-   ```
-2. Copy these files in, replacing the template's `src/` and `CMakeLists.txt`:
-   ```
-   src/plugin-main.c
-   src/odp-source.c
-   src/odp-export.c
-   src/odp-export.h
-   CMakeLists.txt   (merge — keep the template's helper includes)
-   ```
-3. Follow the template's build steps:
-   - **macOS:** `cmake --preset macos` then build in Xcode, or
-     `cmake --build --preset macos`
-   - **Windows:** `cmake --preset windows-x64` then build in Visual Studio
+> **"Windows protected your PC" / unknown publisher:** the installer isn't
+> code-signed, so Windows SmartScreen shows this warning. Click **More info →
+> Run anyway**. (Code signing costs a yearly fee this free project doesn't
+> carry.)
 
-The template's CI can produce signed `.pkg` (macOS) and `.exe`/`.zip`
-(Windows) installers automatically on every git tag — that's how you'd
-distribute to your users.
+## Usage
 
-## File overview
+1. Add an **ODP Presentation** source and select your presentation file.
+2. Optionally set a **cache folder** (where converted slide images live) — one
+   folder can be shared by every deck; they don't collide.
+3. Use the **Slides for OBS** dock to navigate:
+   - **Live** — controls the slide currently on air.
+   - **Preview** — cues the next slide independently (Studio Mode).
 
-| File | Purpose |
-|---|---|
-| `src/plugin-main.c` | Module entry point, registers the source type |
-| `src/odp-source.c` | The "ODP Presentation" source: settings, hotkeys, render delegation, worker thread |
-| `src/odp-export.c` | LibreOffice → PDF → PNG pipeline (the C port of the Python logic) |
-| `src/odp-export.h` | Export pipeline interface |
-| `CMakeLists.txt` | Build configuration |
+The first time you add a deck it converts (this can take from a few seconds to
+a minute depending on deck size and CPU); after that it's cached and loads
+instantly until you edit the file.
 
-## Architecture notes
+### Settings
 
-The source doesn't draw pixels itself. It creates a private child
-`image_source` and, on each slide change, updates that child's `file` setting
-to the current `slide-XXXX.png`, then delegates `video_render` to it. This
-reuses OBS's battle-tested image loading/decoding rather than managing GPU
-textures by hand — the same pragmatic choice the Python script made by
-driving an Image source.
+- **Render DPI** — image resolution. Match it to your canvas: **144** for a
+  1080p canvas is a pixel-perfect, efficient choice. Higher values are
+  downscaled by OBS and just cost time and memory.
+- **Parallel render workers** — how many CPU cores to use when converting.
+  Set it to your core count (e.g. 8).
 
-Hotkeys are registered with `obs_hotkey_register_source`, meaning each ODP
-source instance gets its own Next/Prev/etc. This is cleaner than the script's
-"active deck" detection: because hotkeys are per-source, OBS routes them to
-whichever source is relevant, and you bind keys per source in Settings →
-Hotkeys.
+## Building from source
+
+This is a standard [OBS plugin template](https://github.com/obsproject/obs-plugintemplate)
+project. See the template's documentation for platform build steps. CI builds
+for Windows, macOS, and Linux on every push.
+
+## Licenses and credits
+
+This plugin is licensed under the **GNU General Public License v2** — see
+[LICENSE](LICENSE).
+
+It bundles binaries from the **Poppler** PDF rendering library (used to convert
+PDF pages to images). Poppler is licensed under the GPL. See
+[THIRD-PARTY-LICENSES.md](THIRD-PARTY-LICENSES.md) for details and source
+locations.
+
+Presentation conversion is performed by
+**[LibreOffice](https://www.libreoffice.org/)** (MPL 2.0), which the user
+installs separately — it is not bundled or modified by this plugin.
+
+## Disclaimer
+
+Provided as-is under the terms of the GPL, without warranty. It's a community
+tool built for a specific need; test it in your own setup before relying on it
+for a live production.
