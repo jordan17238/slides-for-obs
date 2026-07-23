@@ -92,6 +92,14 @@ struct odp_source {
 	time_t odp_mtime; /* last-seen modification time of the .odp */
 	float poll_accum; /* seconds accumulated toward next poll */
 
+	/* "Settling" state for the watcher. A save is not one atomic event:
+	 * PowerPoint and LibreOffice write, rename and flush in several steps,
+	 * and a cloud-sync client (OneDrive/Dropbox) may rewrite the file again
+	 * afterwards. Converting a half-written file fails instantly, so a
+	 * change must hold STILL for a poll or two before we act on it. */
+	time_t pending_mtime; /* mtime seen on the last poll, 0 = nothing pending */
+	int64_t pending_size; /* size seen alongside it */
+
 	/* hotkeys */
 	obs_hotkey_id hk_next;
 	obs_hotkey_id hk_prev;
@@ -408,6 +416,16 @@ static void *export_thread(void *param)
 		if (first.ok) {
 			publish_slides(s, first.slide_count, false, odp.array);
 			blog(LOG_INFO, "[odp-presenter] first slide ready — rendering the rest");
+		} else {
+			/* Stage 1 does the same LibreOffice conversion stage 2 would,
+			 * so if it failed here (unreadable file, LibreOffice error)
+			 * stage 2 fails identically. Report it once instead of
+			 * running the whole thing again to reach the same answer. */
+			blog(LOG_ERROR, "[odp-presenter] export failed: %s", first.error);
+			dstr_free(&odp);
+			dstr_free(&cache);
+			s->worker_running = false;
+			return NULL;
 		}
 
 		r = odp_export_range(odp.array, cache.array, dpi, workers, 1, 0, false);
@@ -802,15 +820,44 @@ static void odp_video_tick(void *data, float seconds)
 		return;
 
 	struct stat st;
-	if (stat(path_copy, &st) == 0 && st.st_mtime > baseline) {
-		blog(LOG_INFO, "[odp-presenter] '%s' changed on disk, re-exporting", path_copy);
-		/* Bump baseline immediately so we don't fire repeatedly while the
-		 * re-export runs. The worker will set the authoritative value. */
+	if (stat(path_copy, &st) != 0)
+		return;
+
+	if (st.st_mtime <= baseline) {
+		/* Nothing new. Drop any half-tracked change. */
 		pthread_mutex_lock(&s->lock);
-		s->odp_mtime = st.st_mtime;
+		s->pending_mtime = 0;
 		pthread_mutex_unlock(&s->lock);
-		trigger_export(s);
+		return;
 	}
+
+	/* The file is newer than what we exported — but it may still be being
+	 * written. Wait until its mtime AND size are unchanged across two
+	 * consecutive polls (~2 s apart) before converting.
+	 *
+	 * Without this, saving a deck fires the export immediately and
+	 * LibreOffice is handed a partially-written file: it gives up in a
+	 * fraction of a second with exit code 1 and the refresh fails. Waiting
+	 * for the file to go quiet costs a couple of seconds and makes
+	 * edit-then-refresh reliable. */
+	pthread_mutex_lock(&s->lock);
+	bool settled = (s->pending_mtime == st.st_mtime && s->pending_size == (int64_t)st.st_size);
+	s->pending_mtime = st.st_mtime;
+	s->pending_size = (int64_t)st.st_size;
+	pthread_mutex_unlock(&s->lock);
+
+	if (!settled)
+		return; /* still changing — check again next poll */
+
+	blog(LOG_INFO, "[odp-presenter] '%s' changed on disk, re-exporting", path_copy);
+
+	/* Bump baseline immediately so we don't fire repeatedly while the
+	 * re-export runs. The worker will set the authoritative value. */
+	pthread_mutex_lock(&s->lock);
+	s->odp_mtime = st.st_mtime;
+	s->pending_mtime = 0;
+	pthread_mutex_unlock(&s->lock);
+	trigger_export(s);
 }
 
 static void odp_video_render(void *data, gs_effect_t *effect)
