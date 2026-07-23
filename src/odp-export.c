@@ -456,6 +456,45 @@ void odp_deck_subdir(const char *odp_path, const char *cache_dir, char *out, siz
 	dstr_free(&stem);
 }
 
+/* Straight byte-for-byte file copy.
+ *
+ * Deliberately built on os_fopen/fread/fwrite rather than a platform copy
+ * helper: this file already uses os_fopen, so there is no risk of reaching for
+ * an API that isn't there. Opening for read succeeds even while another
+ * program has the file open for editing, which is exactly the case this
+ * exists to serve. */
+static bool copy_file_bytes(const char *src, const char *dst)
+{
+	FILE *in = os_fopen(src, "rb");
+	if (!in)
+		return false;
+
+	FILE *out = os_fopen(dst, "wb");
+	if (!out) {
+		fclose(in);
+		return false;
+	}
+
+	char buf[64 * 1024];
+	size_t n;
+	bool ok = true;
+	while ((n = fread(buf, 1, sizeof(buf), in)) > 0) {
+		if (fwrite(buf, 1, n, out) != n) {
+			ok = false;
+			break;
+		}
+	}
+	if (ferror(in))
+		ok = false;
+
+	fclose(in);
+	fclose(out);
+
+	if (!ok)
+		os_unlink(dst); /* never leave a truncated copy behind */
+	return ok;
+}
+
 /* ---- parallel PDF -> PNG rendering ------------------------------------- */
 
 /* Upper bound on concurrent pdftoppm processes, whatever the user asks for. */
@@ -867,23 +906,55 @@ odp_export_result odp_export_range(const char *odp_path, const char *cache_dir, 
 				dstr_ncat(&envarg, c, 1);
 		}
 
+		/* ── Convert a private COPY, not the original ────────────────
+		 *
+		 * When the presentation is open in PowerPoint (or Impress), the
+		 * editor leaves a hidden lock file beside it named "~$<filename>".
+		 * LibreOffice honours that lock: it decides the document is in
+		 * use, tries to ask the user what to do, and — with --headless
+		 * there is nobody to ask — gives up immediately with exit code 1.
+		 * That is why a deck that converts perfectly when closed fails in
+		 * half a second while you have it open for editing.
+		 *
+		 * Copying the deck into our own working folder sidesteps this
+		 * entirely: the copy has no "~$" lock file next to it, so
+		 * LibreOffice just opens it. The copy also forces a cloud-synced
+		 * file (OneDrive and similar) to be fully materialised on disk
+		 * before we hand it over.
+		 *
+		 * The copy keeps the SAME filename stem, so --convert-to still
+		 * writes <stem>.pdf into work_dir exactly as before. If the copy
+		 * fails for any reason we fall back to converting the original,
+		 * which is no worse than the previous behaviour. */
+		struct dstr src_copy;
+		dstr_init(&src_copy);
+		const char *ext = strrchr(base, '.');
+		dstr_printf(&src_copy, "%s/%s%s", work_dir, stem.array, ext ? ext : "");
+
+		const char *convert_input = odp_path;
+		if (strcmp(src_copy.array, odp_path) != 0) {
+			os_unlink(src_copy.array); /* replace any previous copy */
+			if (copy_file_bytes(odp_path, src_copy.array)) {
+				convert_input = src_copy.array;
+			} else {
+				blog(LOG_WARNING,
+				     "[odp-presenter] could not copy the presentation "
+				     "aside (%s) — converting the original; if it is "
+				     "open in another program this may fail",
+				     src_copy.array);
+			}
+		}
+
 		const char *argv[] = {
-			odp_tool_libreoffice(),
-			envarg.array,
-			"--headless",
-			"--norestore",
-			"--convert-to",
-			"pdf",
-			"--outdir",
-			work_dir,
-			odp_path,
-			NULL,
+			odp_tool_libreoffice(), envarg.array, "--headless", "--norestore",
+			"--convert-to",         "pdf",        "--outdir",   work_dir,
+			convert_input,          NULL,
 		};
 
 		blog(LOG_INFO,
 		     "[odp-presenter] running: %s %s --headless --norestore "
 		     "--convert-to pdf --outdir '%s' '%s'",
-		     odp_tool_libreoffice(), envarg.array, work_dir, odp_path);
+		     odp_tool_libreoffice(), envarg.array, work_dir, convert_input);
 
 		/* Only one LibreOffice conversion at a time across the plugin
 		 * (see s_libreoffice_lock). Without this, two decks or a
@@ -894,6 +965,13 @@ odp_export_result odp_export_range(const char *odp_path, const char *cache_dir, 
 		int rc = run_argv(argv, NULL, NULL);
 		blog(LOG_INFO, "[odp-presenter] LibreOffice took %.1f s", (os_gettime_ns() - t0) / 1.0e9);
 		pthread_mutex_unlock(&s_libreoffice_lock);
+
+		/* Drop the working copy immediately. The cache folder often sits
+		 * in a cloud-synced location, and leaving a full duplicate of
+		 * every deck there would sync for no reason. */
+		if (convert_input == src_copy.array)
+			os_unlink(src_copy.array);
+		dstr_free(&src_copy);
 		dstr_free(&envarg);
 		dstr_free(&profdir);
 		dstr_free(&profile);
