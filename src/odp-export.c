@@ -465,12 +465,53 @@ void odp_deck_subdir(const char *odp_path, const char *cache_dir, char *out, siz
  * exists to serve. */
 static bool copy_file_bytes(const char *src, const char *dst)
 {
-	FILE *in = os_fopen(src, "rb");
-	if (!in)
+#if defined(_WIN32)
+	/* Open the source with CreateFile, not fopen.
+	 *
+	 * Office applications keep the document open while you edit it, and
+	 * they hold it with delete rights — saving works by writing a temp file
+	 * and replacing the original. Windows only lets a second process open
+	 * the file if that process PERMITS everything the first one is doing,
+	 * so a reader must pass FILE_SHARE_DELETE as well as READ and WRITE.
+	 * The C runtime's fopen() grants only READ|WRITE, so it fails with a
+	 * sharing violation on a deck that is open in PowerPoint — which is
+	 * exactly the case this copy exists to handle. */
+	HANDLE in = CreateFileA(src, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+				OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+	if (in == INVALID_HANDLE_VALUE) {
+		blog(LOG_WARNING, "[odp-presenter] cannot read '%s' (Windows error %lu)", src, GetLastError());
 		return false;
+	}
 
 	FILE *out = os_fopen(dst, "wb");
 	if (!out) {
+		blog(LOG_WARNING, "[odp-presenter] cannot create '%s'", dst);
+		CloseHandle(in);
+		return false;
+	}
+
+	char buf[64 * 1024];
+	DWORD n = 0;
+	bool ok = true;
+	while (ReadFile(in, buf, (DWORD)sizeof(buf), &n, NULL) && n > 0) {
+		if (fwrite(buf, 1, (size_t)n, out) != (size_t)n) {
+			ok = false;
+			break;
+		}
+	}
+
+	CloseHandle(in);
+	fclose(out);
+#else
+	FILE *in = os_fopen(src, "rb");
+	if (!in) {
+		blog(LOG_WARNING, "[odp-presenter] cannot read '%s'", src);
+		return false;
+	}
+
+	FILE *out = os_fopen(dst, "wb");
+	if (!out) {
+		blog(LOG_WARNING, "[odp-presenter] cannot create '%s'", dst);
 		fclose(in);
 		return false;
 	}
@@ -489,6 +530,7 @@ static bool copy_file_bytes(const char *src, const char *dst)
 
 	fclose(in);
 	fclose(out);
+#endif
 
 	if (!ok)
 		os_unlink(dst); /* never leave a truncated copy behind */
