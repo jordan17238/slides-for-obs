@@ -456,6 +456,54 @@ void odp_deck_subdir(const char *odp_path, const char *cache_dir, char *out, siz
 	dstr_free(&stem);
 }
 
+/* FNV-1a: a tiny, fast, non-cryptographic hash. We only need "did these bytes
+ * change", not collision resistance, so this is ideal — no dependencies,
+ * streams in a single pass. Returns false if the file can't be opened, which
+ * on Windows includes an editor holding it exclusively mid-save; that false is
+ * the watcher's signal to wait and retry. */
+bool odp_hash_file(const char *path, uint64_t *out_hash)
+{
+	uint64_t h = 1469598103934665603ULL; /* FNV offset basis */
+	const uint64_t prime = 1099511628211ULL;
+
+#if defined(_WIN32)
+	/* Same sharing as copy_file_bytes (FILE_SHARE_DELETE included) so a deck
+	 * held open by PowerPoint can still be read. An exclusive hold mid-save
+	 * makes this fail, which is exactly the "not ready yet" signal. */
+	HANDLE in = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+				OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+	if (in == INVALID_HANDLE_VALUE)
+		return false;
+
+	char buf[64 * 1024];
+	DWORD n = 0;
+	while (ReadFile(in, buf, (DWORD)sizeof(buf), &n, NULL) && n > 0) {
+		for (DWORD i = 0; i < n; i++) {
+			h ^= (unsigned char)buf[i];
+			h *= prime;
+		}
+	}
+	CloseHandle(in);
+#else
+	FILE *in = os_fopen(path, "rb");
+	if (!in)
+		return false;
+
+	char buf[64 * 1024];
+	size_t n;
+	while ((n = fread(buf, 1, sizeof(buf), in)) > 0) {
+		for (size_t i = 0; i < n; i++) {
+			h ^= (unsigned char)buf[i];
+			h *= prime;
+		}
+	}
+	fclose(in);
+#endif
+
+	*out_hash = h;
+	return true;
+}
+
 /* Straight byte-for-byte file copy.
  *
  * Deliberately built on os_fopen/fread/fwrite rather than a platform copy
@@ -799,11 +847,11 @@ int odp_cached_slide_count(const char *odp_path, const char *cache_dir)
 
 odp_export_result odp_export(const char *odp_path, const char *cache_dir, int dpi, int workers)
 {
-	return odp_export_range(odp_path, cache_dir, dpi, workers, 1, 0, true);
+	return odp_export_range(odp_path, cache_dir, dpi, workers, 1, 0, ODP_CACHE_FULL);
 }
 
 odp_export_result odp_export_range(const char *odp_path, const char *cache_dir, int dpi, int workers, int first_page,
-				   int last_page, bool use_cache)
+				   int last_page, int cache_mode)
 {
 	odp_export_result res = {0};
 	res.ok = false;
@@ -866,11 +914,10 @@ odp_export_result odp_export_range(const char *odp_path, const char *cache_dir, 
 	dstr_printf(&pdf_path, "%s/%s.pdf", work_dir, stem.array);
 
 	/* ── Fast path: reuse existing slides ────────────────────────────
-	 * If the cached PNGs are newer than the source presentation AND there
-	 * are as many of them as the PDF has pages, the cache is current and
-	 * complete — skip LibreOffice and pdftoppm entirely and just report
-	 * the count. */
-	if (use_cache && first_page <= 1 && last_page == 0) {
+	 * Full cache reuse is allowed only in ODP_CACHE_FULL. If the cached
+	 * PNGs are newer than the source AND there are as many as the PDF has
+	 * pages, skip LibreOffice and pdftoppm entirely. */
+	if (cache_mode == ODP_CACHE_FULL && first_page <= 1 && last_page == 0) {
 		int fresh = cache_fresh_count(work_dir, odp_path, pdf_path.array);
 		if (fresh > 0) {
 			res.ok = true;
@@ -886,16 +933,35 @@ odp_export_result odp_export_range(const char *odp_path, const char *cache_dir, 
 		}
 	}
 
-	/* Skip the (slow) LibreOffice conversion if a PDF already exists and is
-	 * at least as new as the .odp. This makes the tail render of the staged
-	 * flow nearly free, and avoids re-launching LibreOffice for the second
-	 * page-range call. */
+	/* Decide whether the slow LibreOffice conversion can be skipped.
+	 *
+	 *   ODP_CACHE_FULL    — reuse a PDF that is at least as new as the
+	 *                       source. Used for a normal (re)load where nothing
+	 *                       is known to have changed.
+	 *   ODP_CACHE_PDF     — the PDF was produced earlier in THIS run
+	 *                       (stage 1 of a staged render), so reuse it and
+	 *                       only re-rasterise. Trusted because our own stage
+	 *                       1 just wrote it moments ago.
+	 *   ODP_CACHE_NONE    — force a fresh LibreOffice conversion. Used when
+	 *                       export_thread knows the deck changed on disk.
+	 *                       A PDF newer than the source is NOT proof it was
+	 *                       built from the current content (OneDrive sync and
+	 *                       the copy-aside step can push the PDF mtime ahead
+	 *                       while the content is stale) — trusting it here is
+	 *                       what left edited decks showing their old slides.
+	 */
 	bool pdf_fresh = false;
-	{
+	if (cache_mode == ODP_CACHE_FULL) {
 		struct stat pst, ost;
 		if (stat(pdf_path.array, &pst) == 0 && stat(odp_path, &ost) == 0 && pst.st_mtime >= ost.st_mtime)
 			pdf_fresh = true;
+	} else if (cache_mode == ODP_CACHE_PDF) {
+		/* Stage 1 of this same run just produced the PDF; reuse it as long
+		 * as it actually exists. */
+		if (file_exists(pdf_path.array))
+			pdf_fresh = true;
 	}
+	/* ODP_CACHE_NONE leaves pdf_fresh = false → always re-convert. */
 
 	if (!pdf_fresh) {
 		struct dstr profile;

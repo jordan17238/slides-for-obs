@@ -86,19 +86,29 @@ struct odp_source {
 	bool worker_started;   /* s->worker holds a joinable thread handle */
 	bool reload_requested; /* ask the running worker to restart */
 	bool abort_requested;  /* ask the running worker to exit ASAP (destroy) */
+	bool force_refresh;    /* deck changed on disk: skip cache, force convert */
 	pthread_mutex_t lock;
 
 	/* auto-refresh: poll the .odp mtime and re-export when it changes */
 	time_t odp_mtime; /* last-seen modification time of the .odp */
 	float poll_accum; /* seconds accumulated toward next poll */
 
-	/* "Settling" state for the watcher. A save is not one atomic event:
-	 * PowerPoint and LibreOffice write, rename and flush in several steps,
-	 * and a cloud-sync client (OneDrive/Dropbox) may rewrite the file again
-	 * afterwards. Converting a half-written file fails instantly, so a
-	 * change must hold STILL for a poll or two before we act on it. */
-	time_t pending_mtime; /* mtime seen on the last poll, 0 = nothing pending */
-	int64_t pending_size; /* size seen alongside it */
+	/* Change detection by CONTENT, not timestamp.
+	 *
+	 * A OneDrive/Dropbox sync and a real edit both bump the file's mtime, so
+	 * timestamps cannot tell "the user saved a change" apart from "the cloud
+	 * client re-touched an identical file". Hashing the bytes can: only a
+	 * real edit changes the hash. We re-convert when the hash differs from
+	 * the one we last successfully converted, and ignore sync touches that
+	 * leave the content identical.
+	 *
+	 * converted_hash is the hash of the deck the cache currently reflects.
+	 * pending_hash / pending_polls debounce a change: we wait for the hash
+	 * to hold steady across a couple of polls (and the file to be readable)
+	 * before converting, so we don't start mid-save. */
+	uint64_t converted_hash; /* hash of the deck the cache reflects, 0 = none */
+	uint64_t pending_hash;   /* hash seen on the last poll while debouncing */
+	int pending_polls;       /* consecutive polls pending_hash has held */
 
 	/* hotkeys */
 	obs_hotkey_id hk_next;
@@ -400,7 +410,17 @@ static void *export_thread(void *param)
 	 * When the cache is already complete both stages are skipped and the
 	 * slides are published immediately. */
 	odp_export_result r = {0};
-	int cached = odp_cached_slide_count(odp.array, cache.array);
+
+	/* Did the deck change on disk since we last rendered? If so, do not take
+	 * the cached-slides shortcut below — the whole reason we were triggered
+	 * is that the content is different, and the cache is stale by definition.
+	 * Read-and-clear the flag under the lock. */
+	pthread_mutex_lock(&s->lock);
+	bool forced = s->force_refresh;
+	s->force_refresh = false;
+	pthread_mutex_unlock(&s->lock);
+
+	int cached = forced ? 0 : odp_cached_slide_count(odp.array, cache.array);
 
 	if (cached > 0) {
 		blog(LOG_INFO, "[odp-presenter] %d cached slides ready", cached);
@@ -408,11 +428,14 @@ static void *export_thread(void *param)
 		r.ok = true;
 		r.slide_count = cached;
 	} else {
-		/* Stage 1 and stage 2 both pass use_cache = false: this thread has
-		 * already established (above) that the cache is not complete, and
-		 * stage 2 must never mistake the single page stage 1 just wrote
-		 * for a finished deck. */
-		odp_export_result first = odp_export_range(odp.array, cache.array, dpi, workers, 1, 1, false);
+		/* Stage 1 forces a fresh LibreOffice conversion when the deck
+		 * changed (ODP_CACHE_NONE); otherwise a normal first load may
+		 * reuse a valid cached PDF (ODP_CACHE_FULL). Stage 2 then reuses
+		 * the PDF stage 1 just produced (ODP_CACHE_PDF) and only
+		 * re-rasterises — never mistaking stage 1's single page for the
+		 * finished deck. */
+		int stage1_mode = forced ? ODP_CACHE_NONE : ODP_CACHE_FULL;
+		odp_export_result first = odp_export_range(odp.array, cache.array, dpi, workers, 1, 1, stage1_mode);
 		if (first.ok) {
 			publish_slides(s, first.slide_count, false, odp.array);
 			blog(LOG_INFO, "[odp-presenter] first slide ready — rendering the rest");
@@ -422,21 +445,35 @@ static void *export_thread(void *param)
 			 * stage 2 fails identically. Report it once instead of
 			 * running the whole thing again to reach the same answer. */
 			blog(LOG_ERROR, "[odp-presenter] export failed: %s", first.error);
+			/* This conversion failed, so the cache does NOT reflect the
+			 * current file. Clear the recorded hash so the watcher sees
+			 * the deck as changed again next poll and retries, instead of
+			 * treating this failed version as done and leaving stale
+			 * slides on screen. */
+			pthread_mutex_lock(&s->lock);
+			s->converted_hash = 0;
+			pthread_mutex_unlock(&s->lock);
 			dstr_free(&odp);
 			dstr_free(&cache);
 			s->worker_running = false;
 			return NULL;
 		}
 
-		r = odp_export_range(odp.array, cache.array, dpi, workers, 1, 0, false);
+		r = odp_export_range(odp.array, cache.array, dpi, workers, 1, 0, ODP_CACHE_PDF);
 		if (r.ok) {
 			publish_slides(s, r.slide_count, true, odp.array);
 			blog(LOG_INFO, "[odp-presenter] full deck ready: %d slides", r.slide_count);
 		}
 	}
 
-	if (!r.ok)
+	if (!r.ok) {
 		blog(LOG_ERROR, "[odp-presenter] export failed: %s", r.error);
+		/* Cache doesn't reflect the current file — clear the hash so the
+		 * watcher retries rather than leaving stale slides up. */
+		pthread_mutex_lock(&s->lock);
+		s->converted_hash = 0;
+		pthread_mutex_unlock(&s->lock);
+	}
 
 	dstr_free(&odp);
 	dstr_free(&cache);
@@ -813,7 +850,6 @@ static void odp_video_tick(void *data, float seconds)
 	char path_copy[1024];
 	if (have_path)
 		snprintf(path_copy, sizeof(path_copy), "%s", s->odp_path.array);
-	time_t baseline = s->odp_mtime;
 	pthread_mutex_unlock(&s->lock);
 
 	if (!have_path)
@@ -823,39 +859,77 @@ static void odp_video_tick(void *data, float seconds)
 	if (stat(path_copy, &st) != 0)
 		return;
 
-	if (st.st_mtime <= baseline) {
-		/* Nothing new. Drop any half-tracked change. */
+	/* Hash the current file contents. A false return means the file can't be
+	 * read right now — almost always because PowerPoint holds it exclusively
+	 * for a moment during its save. That's not an error; just wait for the
+	 * next poll. This is also what avoids starting a conversion mid-save. */
+	uint64_t hash = 0;
+	if (!odp_hash_file(path_copy, &hash)) {
+		blog(LOG_DEBUG,
+		     "[odp-presenter] '%s' not readable yet (held by another "
+		     "program?) — will retry",
+		     path_copy);
+		return;
+	}
+
+	pthread_mutex_lock(&s->lock);
+	uint64_t converted = s->converted_hash;
+	pthread_mutex_unlock(&s->lock);
+
+	/* First time we ever see this deck, adopt whatever hash it has as the
+	 * baseline WITHOUT converting — the initial export on load already
+	 * handled the current contents. Only later CHANGES trigger a refresh. */
+	if (converted == 0) {
 		pthread_mutex_lock(&s->lock);
-		s->pending_mtime = 0;
+		s->converted_hash = hash;
+		s->pending_hash = 0;
+		s->pending_polls = 0;
 		pthread_mutex_unlock(&s->lock);
 		return;
 	}
 
-	/* The file is newer than what we exported — but it may still be being
-	 * written. Wait until its mtime AND size are unchanged across two
-	 * consecutive polls (~2 s apart) before converting.
-	 *
-	 * Without this, saving a deck fires the export immediately and
-	 * LibreOffice is handed a partially-written file: it gives up in a
-	 * fraction of a second with exit code 1 and the refresh fails. Waiting
-	 * for the file to go quiet costs a couple of seconds and makes
-	 * edit-then-refresh reliable. */
+	/* Content identical to what the cache already reflects → nothing to do.
+	 * This is the case that a OneDrive sync hits: the file's mtime changed
+	 * but its bytes didn't, so the hash matches and we correctly ignore it. */
+	if (hash == converted) {
+		pthread_mutex_lock(&s->lock);
+		s->pending_hash = 0;
+		s->pending_polls = 0;
+		pthread_mutex_unlock(&s->lock);
+		return;
+	}
+
+	/* The bytes really changed. Debounce: require the SAME new hash on two
+	 * consecutive polls before converting, so we don't fire on a save that's
+	 * still in progress (a half-written file would hash to something that
+	 * changes again on the next poll). Once stable, convert. */
 	pthread_mutex_lock(&s->lock);
-	bool settled = (s->pending_mtime == st.st_mtime && s->pending_size == (int64_t)st.st_size);
-	s->pending_mtime = st.st_mtime;
-	s->pending_size = (int64_t)st.st_size;
+	bool stable = (s->pending_hash == hash && s->pending_polls >= 1);
+	if (s->pending_hash == hash) {
+		s->pending_polls++;
+	} else {
+		s->pending_hash = hash;
+		s->pending_polls = 1;
+	}
 	pthread_mutex_unlock(&s->lock);
 
-	if (!settled)
-		return; /* still changing — check again next poll */
+	if (!stable)
+		return; /* new content, but let it settle one more poll */
 
 	blog(LOG_INFO, "[odp-presenter] '%s' changed on disk, re-exporting", path_copy);
 
-	/* Bump baseline immediately so we don't fire repeatedly while the
-	 * re-export runs. The worker will set the authoritative value. */
+	/* Record the hash we're about to convert and force a real re-render.
+	 *
+	 * NOTE: we set converted_hash BEFORE the export so repeated polls during
+	 * the (slow) conversion don't re-trigger. If the export fails, the worker
+	 * clears converted_hash back to 0 via export failure handling, so the
+	 * next poll retries rather than treating the failed version as done. */
 	pthread_mutex_lock(&s->lock);
+	s->converted_hash = hash;
 	s->odp_mtime = st.st_mtime;
-	s->pending_mtime = 0;
+	s->pending_hash = 0;
+	s->pending_polls = 0;
+	s->force_refresh = true;
 	pthread_mutex_unlock(&s->lock);
 	trigger_export(s);
 }

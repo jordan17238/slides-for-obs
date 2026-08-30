@@ -13,6 +13,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -58,8 +59,34 @@ odp_export_result odp_export(const char *odp_path, const char *cache_dir, int dp
  * On success, slide_count reports the TOTAL number of slide PNGs currently
  * present in cache_dir (not just the range rendered this call).
  */
+/*
+ * Cache modes for odp_export_range().
+ *   ODP_CACHE_FULL — normal load: reuse cached slides/PDF when newer than the
+ *                    source. Use when nothing is known to have changed.
+ *   ODP_CACHE_PDF  — reuse only the PDF produced earlier in the SAME run
+ *                    (the tail stage of a staged render); re-rasterise PNGs.
+ *   ODP_CACHE_NONE — force a fresh LibreOffice conversion. Use when the deck
+ *                    is known to have changed on disk (edit-triggered), where
+ *                    a timestamp-newer PDF may still hold stale content.
+ */
+#define ODP_CACHE_FULL 0
+#define ODP_CACHE_PDF 1
+#define ODP_CACHE_NONE 2
+
 odp_export_result odp_export_range(const char *odp_path, const char *cache_dir, int dpi, int workers, int first_page,
-				   int last_page, bool use_cache);
+				   int last_page, int cache_mode);
+
+/*
+ * Hash the file's contents into *out_hash and return true on success.
+ *
+ * Returns false if the file cannot be opened — which, on Windows, includes the
+ * case where an editor (PowerPoint) is holding it exclusively mid-save. So a
+ * false return means "not readable right now, try later", and a true return
+ * gives a content hash that changes only when the bytes actually change. The
+ * watcher uses this to (a) wait until a locked file is released and (b) tell a
+ * real edit apart from a cloud-sync touch that left the content identical.
+ */
+bool odp_hash_file(const char *path, uint64_t *out_hash);
 
 /* Returns the page count of the most recently produced PDF in cache_dir,
  * or 0 if none/unknown. Cheap; reads the PDF only. */
