@@ -109,6 +109,7 @@ struct odp_source {
 	uint64_t converted_hash; /* hash of the deck the cache reflects, 0 = none */
 	uint64_t pending_hash;   /* hash seen on the last poll while debouncing */
 	int pending_polls;       /* consecutive polls pending_hash has held */
+	time_t last_seen_mtime;  /* mtime at the last poll — cheap gate before hashing */
 
 	/* hotkeys */
 	obs_hotkey_id hk_next;
@@ -859,16 +860,45 @@ static void odp_video_tick(void *data, float seconds)
 	if (stat(path_copy, &st) != 0)
 		return;
 
-	/* Hash the current file contents. A false return means the file can't be
-	 * read right now — almost always because PowerPoint holds it exclusively
-	 * for a moment during its save. That's not an error; just wait for the
-	 * next poll. This is also what avoids starting a conversion mid-save. */
+	/* Cheap gate: hashing reads the whole file, which is far too much I/O to
+	 * do every poll for every deck (it starves OBS's render thread when many
+	 * sources are loaded). stat() reads no file data, so use the mtime as a
+	 * free first check: if it hasn't moved since the last poll, the bytes
+	 * can't have changed and we skip the hash entirely. A real edit and a
+	 * cloud sync BOTH bump mtime, so this gate never misses a real change —
+	 * it just avoids hashing when absolutely nothing happened, which is
+	 * almost always. The hash below still does the real sync-vs-edit call. */
+	pthread_mutex_lock(&s->lock);
+	bool mtime_moved = (st.st_mtime != s->last_seen_mtime);
+	bool debouncing = (s->pending_polls > 0);
+	s->last_seen_mtime = st.st_mtime;
+	pthread_mutex_unlock(&s->lock);
+
+	/* Skip the hash only when mtime is unchanged AND we're not mid-debounce.
+	 * While a change is settling we must keep hashing each poll to confirm
+	 * it's stable, even though mtime stops moving once the save completes —
+	 * otherwise the confirming poll would be skipped and the deck would
+	 * never re-convert. */
+	if (!mtime_moved && !debouncing)
+		return; /* nothing touched the file, nothing pending — skip */
+
+	/* mtime moved, so SOMETHING touched the file (an edit, or just a sync).
+	 * Hash the contents to find out which. A false return means the file
+	 * can't be read right now — almost always because PowerPoint holds it
+	 * exclusively for a moment during its save. That's not an error; wait
+	 * for the next poll. This also avoids starting a conversion mid-save. */
 	uint64_t hash = 0;
 	if (!odp_hash_file(path_copy, &hash)) {
 		blog(LOG_DEBUG,
 		     "[odp-presenter] '%s' not readable yet (held by another "
 		     "program?) — will retry",
 		     path_copy);
+		/* Force a re-hash next poll even if mtime doesn't move again, by
+		 * clearing our remembered mtime — the file was mid-write, so we
+		 * must not treat the current mtime as "already handled". */
+		pthread_mutex_lock(&s->lock);
+		s->last_seen_mtime = 0;
+		pthread_mutex_unlock(&s->lock);
 		return;
 	}
 
