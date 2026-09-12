@@ -60,6 +60,7 @@ jobs:
           draft: true # review before publishing
           files: |
             release-files/**/SlidesForOBS-Setup.exe
+            release-files/**/*.pkg
             release-files/**/*.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

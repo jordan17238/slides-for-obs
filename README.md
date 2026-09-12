@@ -27,6 +27,10 @@ navigation is frame-accurate and doesn't drop frames on your stream.
 - **[LibreOffice](https://www.libreoffice.org/download/download/)** — free,
   and required to convert presentations. The plugin cannot render slides
   without it. If it's missing, the installer will point you to the download.
+- **macOS only: [Poppler](https://poppler.freedesktop.org/)** — provides
+  `pdftoppm`, used to turn PDF pages into slide images. Install with Homebrew:
+  `brew install poppler`. (The Windows installer bundles these tools, so
+  Windows users don't need this step.)
 
 LibreOffice does not need to be running; the plugin calls it in the background
 only when converting a deck.
@@ -45,6 +49,25 @@ only when converting a deck.
 > code-signed, so Windows SmartScreen shows this warning. Click **More info →
 > Run anyway**. (Code signing costs a yearly fee this free project doesn't
 > carry.)
+
+## Installation (macOS)
+
+1. Install the prerequisites if you don't have them:
+   LibreOffice from [libreoffice.org](https://www.libreoffice.org/download/download/),
+   and poppler via `brew install poppler`.
+2. Download the `.pkg` from the [latest release](../../releases/latest).
+3. Quit OBS Studio if it's open.
+4. Open the `.pkg` and follow the installer. Running it again later updates an
+   existing install.
+5. Start OBS and add a **Slides for OBS → ODP Presentation** source.
+
+> **"cannot be opened because it is from an unidentified developer":** the
+> package isn't signed or notarised, so Gatekeeper blocks it on first open.
+> Right-click (or Control-click) the `.pkg` and choose **Open**, then confirm.
+
+If slides don't appear, check **Help → Log Files → View Current Log** for
+`[odp-presenter]` lines near the top — they report whether LibreOffice and
+`pdftoppm` were found.
 
 ## Usage
 
