@@ -1,18 +1,3 @@
-# Publishes a GitHub Release when a version tag (e.g. v0.1.0) is pushed.
-#
-# It waits for the plugin build and the installer build to produce their
-# artifacts for the tagged commit, gathers them, and attaches them to a
-# Release so users can download a single installer instead of digging through
-# CI artifacts.
-#
-# Usage:
-#   git tag v0.1.0
-#   git push origin v0.1.0
-#
-# The Windows installer is built by installer.yaml (triggered by the plugin
-# build). This workflow downloads that installer artifact and the macOS/Linux
-# plugin artifacts, then creates the Release.
-
 name: Release
 
 on:
@@ -21,7 +6,8 @@ on:
       - "v*"
 
 permissions:
-  contents: write # needed to create a Release
+  contents: write
+  actions: read
 
 jobs:
   release:
@@ -30,37 +16,72 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Wait for build workflows to finish
-        uses: lewagon/wait-on-check-action@v1.3.4
-        with:
-          ref: ${{ github.sha }}
-          running-workflow-name: release
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-          wait-interval: 20
-        continue-on-error: true
-
-      - name: Download all artifacts for this commit
-        uses: actions/download-artifact@v4
-        with:
-          path: release-files
-          merge-multiple: true
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-        continue-on-error: true
-
-      - name: Show what we gathered
+      - name: Wait for this commit's build runs to finish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          echo "Files staged for release:"
-          find release-files -type f 2>/dev/null || echo "(none found yet)"
+          set -euo pipefail
+          deadline=$(( $(date +%s) + 1800 ))
+          while :; do
+            runs=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs?head_sha=$GITHUB_SHA&per_page=100" \
+                     --jq '[.workflow_runs[] | select(.name != "Release") | {name, status, conclusion}]')
+            total=$(jq 'length' <<<"$runs")
+            pending=$(jq '[.[] | select(.status != "completed")] | length' <<<"$runs")
+            win=$(jq '[.[] | select(.name == "Build Installer" and .status == "completed")] | length' <<<"$runs")
+            echo "runs=$total pending=$pending win_installer=$win"
+            jq -r '.[] | "  \(.name): \(.status)/\(.conclusion // "-")"' <<<"$runs"
+            if [ "$total" -gt 0 ] && [ "$pending" -eq 0 ] && [ "$win" -gt 0 ]; then
+              echo "All runs for this commit are finished."
+              break
+            fi
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::warning::Timed out waiting; continuing with whatever exists."
+              break
+            fi
+            sleep 20
+          done
+
+      - name: Gather artifacts from this commit's runs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p release-files
+          ids=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs?head_sha=$GITHUB_SHA&per_page=100" \
+                  --jq '.workflow_runs[] | select(.name != "Release") | .id')
+          echo "Runs to pull from: $ids"
+          for id in $ids; do
+            echo "--- run $id"
+            gh run download "$id" --repo "$GITHUB_REPOSITORY" --dir "release-files/$id" \
+              || echo "    (no artifacts in this run)"
+          done
+          echo "Everything gathered:"
+          find release-files -type f | sort
+
+      - name: Stage installers
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          find release-files -type f \( -name '*.exe' -o -name '*.pkg' -o -name '*.zip' \) \
+            -exec cp -v {} dist/ \;
+          echo "Staged for release:"
+          ls -l dist
+          if [ ! -f dist/SlidesForOBS-Setup.exe ]; then
+            echo "::error::Windows installer missing."
+            exit 1
+          fi
+          if ! ls dist/*.pkg >/dev/null 2>&1; then
+            echo "::error::macOS .pkg missing from the Push run artifact."
+            exit 1
+          fi
 
       - name: Create the release
         uses: softprops/action-gh-release@v2
         with:
           name: ${{ github.ref_name }}
           generate_release_notes: true
-          draft: true # review before publishing
-          files: |
-            release-files/**/SlidesForOBS-Setup.exe
-            release-files/**/*.pkg
-            release-files/**/*.zip
+          draft: true
+          fail_on_unmatched_files: true
+          files: dist/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
